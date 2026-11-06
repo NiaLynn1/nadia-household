@@ -1,22 +1,25 @@
-# NADIA — Solace update
+# NADIA — Solace Household Operations
 
-Nadia responds when a member writes **Nadia** (case-insensitive, including “Nadia’s”) or directly mentions the bot in **any text channel in the configured Solace server**. The `/nadia_talk` command still works.
+Render **Web Service**. Start command: `python main.py`; health check `/health`. Keep existing environment variables `DISCORD_TOKEN`, `SOLACE_GUILD_ID`, `MOMMY_ID`, `DADDY_ID`, `DATABASE_URL`, `OPENAI_API_KEY`. Message Content Intent must be enabled.
 
-## Deploy
-Replace the root `main.py` in your private GitHub repository with this version (and keep `requirements.txt` and `Procfile`). Deploy on Render with existing environment variables.
+## New features
+- Nadia discovers existing room channels by their names on startup. Use `/nadia_rooms` to inspect. Assign new or renamed spaces with `/nadia_room_assign` by selecting a Discord channel (no IDs to copy).
+- Say `Nadia, start the laundry` or `Nadia, run the dishwasher` in any Solace channel. Chore requests from Nia/Sly start persisted staged simulated tasks.
+- `/nadia_job_start`, `/nadia_jobs`, `/nadia_job_cancel`, `/nadia_daily_report`. Job stages advance in background every ~30 seconds and survive Render restarts.
+- `/nadia_clinic_visit` logs a fictional appointment and posts in Nadia's clinic. No real medical care or automatic labor onset.
+- Existing visual library, photo commands, conversation, and other commands retained.
 
-**Discord Developer Portal → Bot → Privileged Gateway Intents → Message Content Intent: ON**. Also grant the bot **View Channel, Read Message History, Send Messages** in every room where she should respond. She cannot see channels she cannot access.
+## Notes and limits
+- This is fictional simulation; no real appliances are controlled. Durations are example simulation values.
+- Chat follow-ups without the word Nadia are not yet enabled. Name-triggered commands are supported.
+- Automatic room discovery matches current known names; unknown rooms can be assigned manually.
+- One room per task category; specialized guest-room selection is not yet implemented.
+- Avoid running multiple copies of Nadia simultaneously; job progress is transactional, but Discord notification delivery is not guaranteed exactly once if a process crashes between DB update and posting.
+- Existing slash command `/nadia_dinner` still suggests menus, while `/nadia_job_start` or a direct natural-language chore request starts a simulated cooking job.
+- Existing images and settings tables are preserved. No destructive migrations.
 
-Existing PostgreSQL tables remain; a new `nadia_chat_history` table is created automatically. Chat memory stores the latest six user/assistant exchanges **per speaker across all Solace channels**, persisted in PostgreSQL. Do not store real sensitive medical information in chat. This is short-term context, not unlimited memory.
-
-## Test
-In two different Solace channels, send “Nadia, can you hear me?” and “Hey Nadia, what did I just ask you?”; check that she replies and remembers the first message. Test as both Nia and Sly to confirm identity.
-
-**Note:** A mention of Nadia in any conversation triggers a reply, including incidental mentions; there is no passive listening to messages without her name. Nadia does not automatically start labor or integrate with Nyla's database.
-
-## Visual library update
-Parent-only commands: `/nadia_photo_subject` (register person/room/memory), `/nadia_photo_add` (upload image), `/nadia_photo_list`, `/nadia_photo_refs`, `/nadia_photo_view`, `/nadia_photo_remove`, and `/nadia_album_photo` (new captures only). References are stored as image bytes in Nadia's PostgreSQL database, separate from Nyla's database. Existing Discord-link-only album records are not automatically recovered.
-
-Nadia can retrieve an exact named subject from a message such as `Nadia, show me the picture of Nursery` in any Solace channel. For reliable matching, use the registered subject name exactly. Photo generation through `/nadia_capture` now includes the newest saved reference for up to four named subjects in the scene prompt, where supported by the configured image model. Image-edit API calls can cost money and reference likeness is not guaranteed. No automatic connection to Nyla's images or care database is included.
-
-This code has passed Python syntax compilation only. Test in Discord/Render before relying on it. PostgreSQL storage size grows with uploads; use private database credentials and protect server access.
+## Suggested test
+1. `/nadia_rooms` — verify kitchen, laundry and clinic assignments.
+2. In any channel say `Nadia, start a load of laundry.`
+3. Check `#laundry-room` for start announcement and `/nadia_jobs` for the countdown.
+4. Use `/nadia_job_cancel` with the job ID if you don't want to wait for the full simulation.
