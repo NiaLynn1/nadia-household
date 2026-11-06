@@ -97,7 +97,7 @@ GUILD = discord.Object(id=GUILD_ID)
 
 async def reject(interaction, parents=False):
     if not allowed(interaction) or (parents and not parent(interaction)):
-        await interaction.response.send_message('This command is restricted to the Solace household.' if not allowed(interaction) else 'Only Mommy or Daddy can manage this.', ephemeral=True)
+        await interaction.response.send_message('This command is restricted to the Solace household.' if not allowed(interaction) else 'Only Nia or Sly can manage this.', ephemeral=True)
         return True
     return False
 
@@ -106,6 +106,11 @@ async def on_ready():
     log.info('NADIA online as %s', bot.user)
     if not daily_housekeeping.is_running():
         daily_housekeeping.start()
+    if not nadia_job_clock.is_running():
+        nadia_job_clock.start()
+    guild=bot.get_guild(GUILD_ID)
+    if guild:
+        await asyncio.to_thread(discover_rooms,guild)
 
 @bot.tree.command(name='nadia_status', description='Show Nadia’s household status', guild=GUILD)
 async def status(interaction: discord.Interaction):
@@ -140,9 +145,8 @@ async def dinner(interaction: discord.Interaction, plan: app_commands.Choice[str
 async def clean(interaction: discord.Interaction):
     if await reject(interaction, True): return
     today = datetime.now(timezone.utc).date().isoformat()
-    await asyncio.to_thread(db,'UPDATE nadia_settings SET cleaning_date=%s WHERE guild_id=%s',(today,GUILD_ID))
-    await asyncio.to_thread(audit,'cleaning',f'completed by request from {interaction.user.id}')
-    await interaction.response.send_message('✨ Solace is refreshed: kitchen counters, living areas, floors, laundry, and nursery surfaces. All fictional household tasks complete.')
+    jid,target,stage,_=await asyncio.to_thread(start_job,'general','General household cleaning',interaction.user.id,interaction.channel_id)
+    await interaction.response.send_message(f'🏡 Started simulated cleaning job #{jid}. Updates in <#{target}>.')
 
 @bot.tree.command(name='nadia_birth', description='Set the fictional birth-story mode; never starts labor automatically', guild=GUILD)
 @app_commands.choices(mode=[app_commands.Choice(name='Waiting',value='waiting'),app_commands.Choice(name='Labor scene (parent-initiated)',value='labor'),app_commands.Choice(name='Postpartum (parent-initiated)',value='postpartum')])
@@ -192,7 +196,7 @@ async def nadia_reply(user_id, message):
     system = (PERSONA + ' ' + speaker_context(user_id) +
               f' Current birth-story mode: {birth_mode}. Household note: {notes[:1000]}. '
               'A fictional labor scene must not change birth mode automatically. '
-              'You only have access to features explicitly implemented in this bot.')
+              'Simulated household chores are only started by the explicit task engine; never promise to start or finish chores, schedule messages, or send notifications unless the engine has confirmed a job ID. If asked to do a chore, invite the user to say Nadia plus a direct request, or use /nadia_job_start. Clinic appointments are fictional, not real examinations. You only have access to features explicitly implemented in this bot.')
     messages = [{'role':'system','content':system}]
     messages.extend({'role':role,'content':content} for role,content in history)
     messages.append({'role':'user','content':message[:3000]})
@@ -226,6 +230,8 @@ async def on_message(message: discord.Message):
     if not message.content.strip():
         return
     try:
+        if await ops_request(message,message.content):
+            return
         target=photo_request_target(message.content)
         if target and message.author.id in (MOMMY_ID,DADDY_ID):
             row=await asyncio.to_thread(find_named_photo,target)
@@ -242,6 +248,283 @@ async def on_message(message: discord.Message):
         log.exception('Nadia name-triggered chat failed')
         await message.reply('I’m having trouble answering just now. Try again in a moment.',mention_author=False)
     await bot.process_commands(message)
+
+
+# ---------- Solace simulated household operations ----------
+# Every duration is simulated; no real appliances or healthcare services are controlled.
+import unicodedata
+
+ROOM_ALIASES = {
+    'kitchen':['main-kitchen'], 'laundry':['laundry-room'],
+    'clinic':['nadias-clinic'], 'living':['living-room'],
+    'bedroom':['primary-suite'], 'nursery':['nylas-room'],
+    'pantry':['walk-in-pantry'], 'dining':['breakfast-nook'],
+    'guest':['guest-room-1','guest-room-2','guest-lounge'],
+    'bathroom':['powder-room'], 'patio':['patio'],
+}
+TASK_STAGES = {
+    'laundry':[('Sorting clothes',3),('Washing clothes',35),('Drying clothes',45),('Folding clothes',12),('Putting clothes away',8)],
+    'dishwasher':[('Loading dishwasher',5),('Washing dishes',55),('Drying dishes',20),('Unloading dishwasher',7)],
+    'cooking':[('Planning and preparing ingredients',10),('Cooking the meal',30),('Plating and serving',5)],
+    'vacuum':[('Preparing vacuum',3),('Vacuuming',22),('Putting equipment away',4)],
+    'mop':[('Preparing floors',5),('Mopping floors',20),('Allowing floors to dry',15)],
+    'dust':[('Preparing supplies',3),('Dusting surfaces',20),('Putting supplies away',4)],
+    'tidy':[('Collecting clutter',8),('Organizing room',15),('Finishing touches',5)],
+    'bathroom':[('Preparing supplies',5),('Cleaning and sanitizing',25),('Replacing towels and supplies',8)],
+    'linens':[('Stripping bedding',5),('Changing linens',15),('Making the bed',5)],
+    'pantry':[('Checking inventory',10),('Organizing shelves',20),('Updating grocery list',8)],
+    'general':[('Preparing supplies',5),('Cleaning and organizing',25),('Final inspection',5)],
+}
+DEFAULT_ROOM = {'laundry':'laundry','dishwasher':'kitchen','cooking':'kitchen',
+                'vacuum':'living','mop':'living','dust':'living','tidy':'living',
+                'bathroom':'bathroom','linens':'bedroom','pantry':'pantry','general':'living'}
+
+
+def ops_init():
+    db('''CREATE TABLE IF NOT EXISTS nadia_room_map (
+        guild_id BIGINT NOT NULL, room_key TEXT NOT NULL, channel_id BIGINT NOT NULL,
+        manually_assigned BOOLEAN NOT NULL DEFAULT FALSE,
+        PRIMARY KEY(guild_id,room_key))''')
+    db('''CREATE TABLE IF NOT EXISTS nadia_jobs (
+        id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, requester_id BIGINT NOT NULL,
+        request_channel_id BIGINT NOT NULL, work_channel_id BIGINT NOT NULL,
+        task_kind TEXT NOT NULL, description TEXT NOT NULL, stages JSONB NOT NULL,
+        stage_index INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'running',
+        due_at TIMESTAMPTZ NOT NULL, started_at TIMESTAMPTZ DEFAULT NOW(),
+        finished_at TIMESTAMPTZ, notified_stage INTEGER NOT NULL DEFAULT 0)''')
+    db('CREATE INDEX IF NOT EXISTS nadia_jobs_due ON nadia_jobs(guild_id,status,due_at)')
+    db('''CREATE TABLE IF NOT EXISTS nadia_clinic_visits (
+        id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, requester_id BIGINT NOT NULL,
+        concern TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'requested',
+        created_at TIMESTAMPTZ DEFAULT NOW())''')
+
+
+def room_normalize(value):
+    value=unicodedata.normalize('NFKD',value.lower())
+    value=''.join(c for c in value if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+','-',value).strip('-')
+
+
+def discover_rooms(guild):
+    channels=[c for c in guild.text_channels if c.permissions_for(guild.me).send_messages]
+    saved=db('SELECT room_key,channel_id,manually_assigned FROM nadia_room_map WHERE guild_id=%s',(GUILD_ID,),True)
+    locked={r[0] for r in saved if r[2] and guild.get_channel(r[1])}
+    for key,aliases in ROOM_ALIASES.items():
+        if key in locked:continue
+        matching=next((c for alias in aliases for c in channels if room_normalize(c.name)==alias),None)
+        if matching:
+            db('''INSERT INTO nadia_room_map(guild_id,room_key,channel_id) VALUES (%s,%s,%s)
+                  ON CONFLICT(guild_id,room_key) DO UPDATE SET channel_id=EXCLUDED.channel_id,
+                  manually_assigned=FALSE WHERE nadia_room_map.manually_assigned=FALSE''',
+               (GUILD_ID,key,matching.id))
+
+
+def get_room_channel(key):
+    rows=db('SELECT channel_id FROM nadia_room_map WHERE guild_id=%s AND room_key=%s',(GUILD_ID,key),True)
+    return rows[0][0] if rows else None
+
+
+def start_job(kind,description,user_id,request_channel_id,room_key=None):
+    stages=TASK_STAGES[kind]
+    target=get_room_channel(room_key or DEFAULT_ROOM[kind]) or request_channel_id
+    due=datetime.now(timezone.utc)+timedelta(minutes=stages[0][1])
+    with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute('''INSERT INTO nadia_jobs(guild_id,requester_id,request_channel_id,work_channel_id,
+                task_kind,description,stages,due_at) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s) RETURNING id''',
+                (GUILD_ID,user_id,request_channel_id,target,kind,description[:400],json.dumps(stages),due))
+            job_id=cur.fetchone()[0]
+    return job_id,target,stages[0][0],due
+
+
+def advance_due_jobs():
+    # Lock the rows to prevent double advancement across worker instances.
+    notices=[]
+    with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute('''SELECT id,work_channel_id,task_kind,description,stages,stage_index,due_at
+                FROM nadia_jobs WHERE guild_id=%s AND status='running' AND due_at<=NOW()
+                ORDER BY due_at LIMIT 40 FOR UPDATE SKIP LOCKED''',(GUILD_ID,))
+            for jid,channel,kind,description,stages,idx,due in cur.fetchall():
+                if isinstance(stages,str):stages=json.loads(stages)
+                next_idx=idx+1
+                if next_idx>=len(stages):
+                    cur.execute('''UPDATE nadia_jobs SET status='completed',stage_index=%s,
+                        finished_at=NOW() WHERE id=%s''',(next_idx,jid))
+                    notices.append((channel,f'✅ **Nadia finished job #{jid}:** {description}. All simulated stages complete.'))
+                else:
+                    # Schedule from now rather than compressing multiple missed stages after a restart.
+                    label,minutes=stages[next_idx]
+                    cur.execute('''UPDATE nadia_jobs SET stage_index=%s,due_at=NOW()+(%s * INTERVAL '1 minute')
+                        WHERE id=%s''',(next_idx,minutes,jid))
+                    notices.append((channel,f'🧹 **Nadia • Job #{jid}:** {description}\nNow: **{label}** (about {minutes} minutes).'))
+    return notices
+
+
+def job_report(user_id=None,limit=8,only_running=False):
+    query='''SELECT id,task_kind,description,status,stages,stage_index,due_at,work_channel_id
+        FROM nadia_jobs WHERE guild_id=%s'''
+    params=[GUILD_ID]
+    if user_id is not None:
+        query+=' AND requester_id=%s';params.append(user_id)
+    if only_running:query+=" AND status='running'"
+    query+=' ORDER BY id DESC LIMIT %s';params.append(limit)
+    return db(query,tuple(params),True)
+
+
+def identify_chore(text):
+    low=text.lower()
+    # Explicit chore requests only; a question about a chore is not an order.
+    if re.search(r'\b(how|when|why|did|is|are|what)\b.{0,28}\b(laundry|dinner|dishwasher|cleaning)\b',low):return None
+    if not re.search(r'\b(please|could you|can you|would you|start|run|do|make|prepare|cook|wash|clean|vacuum|mop|dust|tidy|change|organize|handle|take care of|put on)\b',low):return None
+    patterns=[('laundry',r'\b(laundry|wash (?:the |my |our )?clothes|load of washing)\b'),
+        ('dishwasher',r'\b(dishwasher|wash (?:the )?dishes|do (?:the )?dishes)\b'),
+        ('cooking',r'\b(cook|prepare|make|fix)\b.{0,90}\b(dinner|lunch|breakfast|meal|food|salad|supper)\b|\b(dinner|lunch|breakfast)\b.{0,60}\b(cook|prepare|make|fix)\b'),
+        ('vacuum',r'\b(vacuum|hoover)\b'),('mop',r'\bmop\b'),('dust',r'\bdust\b'),
+        ('linens',r'\b(change (?:the )?(?:sheets|linens|bedding)|make (?:the )?bed)\b'),
+        ('pantry',r'\b(organize|sort|inventory)\b.{0,50}\bpantry\b'),
+        ('bathroom',r'\b(clean|sanitize|scrub)\b.{0,50}\b(bathroom|powder room|toilet)\b'),
+        ('tidy',r'\b(tidy|organize|straighten)\b'),('general',r'\b(clean|housekeeping)\b')]
+    return next((kind for kind,pattern in patterns if re.search(pattern,low)),None)
+
+
+def identify_room(text,kind):
+    low=room_normalize(text)
+    candidates={'nursery':['nursery','nylas-room','nyla-room'],
+        'bedroom':['bedroom','primary-suite','our-room'],
+        'living':['living-room','living-area','family-room'],
+        'guest':['guest-room','guest-suite','guest-lounge'],
+        'kitchen':['kitchen'], 'laundry':['laundry-room','laundromat'],
+        'bathroom':['bathroom','powder-room'], 'pantry':['pantry'],
+        'dining':['dining','breakfast-nook'], 'patio':['patio'], 'clinic':['clinic']}
+    for key,aliases in candidates.items():
+        if any(re.search(r'(?<![a-z])'+re.escape(alias)+r'(?![a-z])',low) for alias in aliases):return key
+    return DEFAULT_ROOM[kind]
+
+
+async def ops_request(message,body):
+    if message.author.id not in (MOMMY_ID,DADDY_ID):return False
+    low=body.lower()
+    if re.search(r'\b(cancel|stop)\b.{0,30}\b(job|task|laundry|dinner|dishwasher|cleaning)\b',low):
+        match=re.search(r'#?(\d+)\b',low)
+        if match:
+            jid=int(match.group(1))
+            changed=await asyncio.to_thread(db,"UPDATE nadia_jobs SET status='cancelled',finished_at=NOW() WHERE guild_id=%s AND id=%s AND status='running'",(GUILD_ID,jid))
+            await message.reply(f'I’ve requested cancellation of simulated job #{jid}. Check `/nadia_jobs` for its status.',mention_author=False)
+        else:
+            await message.reply('Tell me the job number to cancel, darling. You can find it with `/nadia_jobs`.',mention_author=False)
+        return True
+    if re.search(r'\b(how long|progress|status|is .*ready|what.*(doing|working on)|finished yet)\b',low):
+        jobs=await asyncio.to_thread(job_report,None,6,True)
+        if not jobs:
+            await message.reply('No simulated household jobs are running right now, Nia.' if message.author.id==MOMMY_ID else 'No simulated household jobs are running right now, Sly.',mention_author=False)
+        else:
+            now=datetime.now(timezone.utc)
+            lines=[]
+            for jid,kind,desc,status,stages,idx,due,channel in jobs:
+                stage=stages[idx][0] if idx<len(stages) else 'Finishing'
+                minutes=max(0,round((due-now).total_seconds()/60))
+                lines.append(f'#{jid} • {desc[:70]} — {stage}, ~{minutes} min to next stage')
+            await message.reply('**Nadia’s active jobs:**\n'+'\n'.join(lines),mention_author=False)
+        return True
+    kind=identify_chore(body)
+    if not kind:return False
+    room=identify_room(body,kind)
+    jid,target,stage,due=await asyncio.to_thread(start_job,kind,body,message.author.id,message.channel.id,room)
+    who='Nia' if message.author.id==MOMMY_ID else 'Sly'
+    await message.reply(f'Of course, {who}. I’ve started **simulated job #{jid}** and will handle every stage automatically. Updates will appear in <#{target}>.',mention_author=False)
+    dest=bot.get_channel(target)
+    if dest:
+        await dest.send(f'🏡 **Nadia started job #{jid}**\nTask: {body[:250]}\nFirst stage: **{stage}**. I’ll post updates as the simulated work progresses.')
+    return True
+
+
+@tasks.loop(seconds=30)
+async def nadia_job_clock():
+    try:
+        notices=await asyncio.to_thread(advance_due_jobs)
+        for channel_id,line in notices:
+            channel=bot.get_channel(channel_id)
+            if channel:
+                try:await channel.send(line)
+                except discord.HTTPException:log.exception('Could not post job update')
+    except Exception:log.exception('Nadia household job clock failed')
+
+@nadia_job_clock.before_loop
+async def before_job_clock():
+    await bot.wait_until_ready()
+
+@bot.tree.command(name='nadia_room_assign',description='Assign a Solace room to a task area',guild=GUILD)
+@app_commands.choices(area=[app_commands.Choice(name=k.title(),value=k) for k in ROOM_ALIASES])
+async def nadia_room_assign(interaction:discord.Interaction,area:app_commands.Choice[str],channel:discord.TextChannel):
+    if await reject(interaction,True):return
+    await asyncio.to_thread(db,'''INSERT INTO nadia_room_map(guild_id,room_key,channel_id,manually_assigned)
+        VALUES (%s,%s,%s,TRUE) ON CONFLICT(guild_id,room_key) DO UPDATE SET
+        channel_id=EXCLUDED.channel_id,manually_assigned=TRUE''',(GUILD_ID,area.value,channel.id))
+    await interaction.response.send_message(f'Assigned **{area.name}** duties to {channel.mention}.',ephemeral=True)
+
+@bot.tree.command(name='nadia_rooms',description='See Nadia’s current room assignments',guild=GUILD)
+async def nadia_rooms(interaction:discord.Interaction):
+    if await reject(interaction):return
+    rows=await asyncio.to_thread(db,'SELECT room_key,channel_id FROM nadia_room_map WHERE guild_id=%s ORDER BY room_key',(GUILD_ID,),True)
+    await interaction.response.send_message(('**Nadia’s rooms**\n'+'\n'.join(f'• {k}: <#{v}>' for k,v in rows))[:1900] if rows else 'No room assignments yet.',ephemeral=True)
+
+@bot.tree.command(name='nadia_jobs',description='See simulated household tasks and countdowns',guild=GUILD)
+async def nadia_jobs(interaction:discord.Interaction):
+    if await reject(interaction):return
+    rows=await asyncio.to_thread(job_report,None,10,False)
+    now=datetime.now(timezone.utc)
+    lines=[]
+    for jid,kind,desc,status,stages,idx,due,channel in rows:
+        stage=stages[idx][0] if status=='running' and idx<len(stages) else status
+        mins=max(0,round((due-now).total_seconds()/60)) if status=='running' else 0
+        lines.append(f'#{jid} **{status}** • {desc[:75]} • {stage}'+(f' (~{mins} min)' if status=='running' else ''))
+    await interaction.response.send_message(('**Nadia’s household jobs**\n'+'\n'.join(lines))[:1900] if lines else 'No jobs recorded yet.',ephemeral=True)
+
+@bot.tree.command(name='nadia_job_start',description='Start a complete simulated chore',guild=GUILD)
+@app_commands.choices(chore=[app_commands.Choice(name=k.title(),value=k) for k in TASK_STAGES])
+async def nadia_job_start(interaction:discord.Interaction,chore:app_commands.Choice[str],description:str=''):
+    if await reject(interaction,True):return
+    desc=description.strip() or chore.name
+    jid,target,stage,due=await asyncio.to_thread(start_job,chore.value,desc,interaction.user.id,interaction.channel_id)
+    await interaction.response.send_message(f'🏡 Started simulated job **#{jid}**: {desc}. Updates in <#{target}>.')
+    ch=bot.get_channel(target)
+    if ch:await ch.send(f'🧹 **Nadia • Job #{jid}**: {desc}. Starting **{stage}**.')
+
+@bot.tree.command(name='nadia_job_cancel',description='Cancel a running simulated household task',guild=GUILD)
+async def nadia_job_cancel(interaction:discord.Interaction,job_id:int):
+    if await reject(interaction,True):return
+    def cancel():
+        with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE nadia_jobs SET status='cancelled',finished_at=NOW() WHERE guild_id=%s AND id=%s AND status='running' RETURNING id",(GUILD_ID,job_id))
+                return cur.fetchone() is not None
+    ok=await asyncio.to_thread(cancel)
+    await interaction.response.send_message(f'Job #{job_id} cancelled.' if ok else 'No running job found with that ID.',ephemeral=True)
+
+@bot.tree.command(name='nadia_daily_report',description='See today’s completed household jobs',guild=GUILD)
+async def nadia_daily_report(interaction:discord.Interaction):
+    if await reject(interaction):return
+    rows=await asyncio.to_thread(db,'''SELECT id,description FROM nadia_jobs WHERE guild_id=%s
+        AND status='completed' AND finished_at >= date_trunc('day',NOW())
+        ORDER BY finished_at DESC LIMIT 20''',(GUILD_ID,),True)
+    await interaction.response.send_message(('**Today’s completed simulated jobs**\n'+'\n'.join(f'• #{jid} {desc[:100]}' for jid,desc in rows))[:1900] if rows else 'No simulated jobs completed today (UTC).',ephemeral=True)
+
+@bot.tree.command(name='nadia_clinic_visit',description='Request a fictional wellness appointment in Nadia’s clinic',guild=GUILD)
+async def nadia_clinic_visit(interaction:discord.Interaction,concern:str):
+    if await reject(interaction,True):return
+    await interaction.response.defer(ephemeral=True)
+    def save():
+        with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute('''INSERT INTO nadia_clinic_visits(guild_id,requester_id,concern)
+                    VALUES (%s,%s,%s) RETURNING id''',(GUILD_ID,interaction.user.id,concern[:700]))
+                return cur.fetchone()[0]
+    vid=await asyncio.to_thread(save)
+    ch_id=await asyncio.to_thread(get_room_channel,'clinic')
+    if ch_id and (ch:=bot.get_channel(ch_id)):
+        await ch.send(f'🩺 **Nadia’s Clinic** • Fictional appointment #{vid} requested. Nia or Sly can continue the scene here. No real medical examination or diagnosis has occurred.')
+    await interaction.followup.send(f'Fictional clinic visit #{vid} recorded. Clinic: '+(f'<#{ch_id}>' if ch_id else 'not assigned yet')+'. For actual medical concerns, consult a qualified clinician.',ephemeral=True)
 
 # Persistent visual reference library (separate from Nyla's database).
 MAX_REFERENCE_BYTES = 5 * 1024 * 1024
@@ -457,20 +740,8 @@ async def wellness(interaction: discord.Interaction, concern: str):
 
 @tasks.loop(minutes=30)
 async def daily_housekeeping():
-    now=datetime.now(timezone.utc)
-    # One daily fictional report, UTC date; no action on real-world home.
-    today=now.date().isoformat()
-    try:
-        _,done,_,_,_=await asyncio.to_thread(setting)
-        if done==today:return
-        channel_id=os.getenv('HOUSEHOLD_CHANNEL_ID','')
-        channel=bot.get_channel(int(channel_id)) if channel_id.isdigit() else None
-        if not channel:return
-        await channel.send('✨ **Nadia’s daily Solace refresh:** living spaces tidied, kitchen refreshed, laundry organized, and nursery checked. Fictional household routine complete. ❤️')
-        await asyncio.to_thread(db,'UPDATE nadia_settings SET cleaning_date=%s WHERE guild_id=%s',(today,GUILD_ID))
-        await asyncio.to_thread(audit,'daily_cleaning','daily scheduled fictional report')
-    except Exception:
-        log.exception('Daily housekeeping failed')
+    # Daily chores are not silently marked complete. Explicit tasks are tracked by nadia_job_clock.
+    return
 
 @daily_housekeeping.before_loop
 async def before_housekeeping():
@@ -479,6 +750,7 @@ async def before_housekeeping():
 @bot.event
 async def setup_hook():
     await asyncio.to_thread(init_db)
+    await asyncio.to_thread(ops_init)
     synced=await bot.tree.sync(guild=GUILD)
     log.info('Synced %s Solace slash commands',len(synced))
 
