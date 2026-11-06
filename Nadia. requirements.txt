@@ -1,0 +1,4 @@
+discord.py>=2.4,<3
+openai>=1.60,<3
+Flask>=3.0,<4
+psycopg[binary]>=3.2,<4
