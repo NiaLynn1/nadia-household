@@ -1,25 +1,42 @@
-# NADIA — Solace Household Operations
+# NADIA — Solace + Maison Élise upgrade
 
-Render **Web Service**. Start command: `python main.py`; health check `/health`. Keep existing environment variables `DISCORD_TOKEN`, `SOLACE_GUILD_ID`, `MOMMY_ID`, `DADDY_ID`, `DATABASE_URL`, `OPENAI_API_KEY`. Message Content Intent must be enabled.
+This package contains a revised `main.py` built from the user's existing NADIA code. It preserves the PostgreSQL tables, task timers, commands, and photo library, while adding separate guild contexts. It has passed Python syntax compilation but **has not been tested against live Discord, PostgreSQL or OpenAI services**. Deploy to staging first.
 
-## New features
-- Nadia discovers existing room channels by their names on startup. Use `/nadia_rooms` to inspect. Assign new or renamed spaces with `/nadia_room_assign` by selecting a Discord channel (no IDs to copy).
-- Say `Nadia, start the laundry` or `Nadia, run the dishwasher` in any Solace channel. Chore requests from Nia/Sly start persisted staged simulated tasks.
-- `/nadia_job_start`, `/nadia_jobs`, `/nadia_job_cancel`, `/nadia_daily_report`. Job stages advance in background every ~30 seconds and survive Render restarts.
-- `/nadia_clinic_visit` logs a fictional appointment and posts in Nadia's clinic. No real medical care or automatic labor onset.
-- Existing visual library, photo commands, conversation, and other commands retained.
+## Render environment variables
 
-## Notes and limits
-- This is fictional simulation; no real appliances are controlled. Durations are example simulation values.
-- Chat follow-ups without the word Nadia are not yet enabled. Name-triggered commands are supported.
-- Automatic room discovery matches current known names; unknown rooms can be assigned manually.
-- One room per task category; specialized guest-room selection is not yet implemented.
-- Avoid running multiple copies of Nadia simultaneously; job progress is transactional, but Discord notification delivery is not guaranteed exactly once if a process crashes between DB update and posting.
-- Existing slash command `/nadia_dinner` still suggests menus, while `/nadia_job_start` or a direct natural-language chore request starts a simulated cooking job.
-- Existing images and settings tables are preserved. No destructive migrations.
+Required (existing): `DISCORD_TOKEN`, `SOLACE_GUILD_ID`, `MOMMY_ID`, `DADDY_ID`, `DATABASE_URL`, `OPENAI_API_KEY`.
 
-## Suggested test
-1. `/nadia_rooms` — verify kitchen, laundry and clinic assignments.
-2. In any channel say `Nadia, start a load of laundry.`
-3. Check `#laundry-room` for start announcement and `/nadia_jobs` for the countdown.
-4. Use `/nadia_job_cancel` with the job ID if you don't want to wait for the full simulation.
+New: `MAISON_ELISE_GUILD_ID=1567054443390828594`.
+
+Optional **Nyla care integration**: `NYLA_DATABASE_URL` is the PostgreSQL connection string for Nyla's database (if the bots share a database, set it equal to `DATABASE_URL`); `NYLA_GUILD_ID` is the original guild ID where Nyla's `nyla_mode` and `nyla_test_state`/`baby_state` rows exist (normally the Solace ID). Without these, Nadia will not modify Nyla's needs or claim she did.
+
+Nyla's care integration is **Solace-only**, and uses Nyla's actual TEST/OFFICIAL mode to select the correct state table. It ignores dormant TEST. It checks every two minutes, uses row locks, and updates feeding, diaper, or comfort in the Nyla database. It doesn't force sleep or fabricate energy recovery. Care messages post to Nyla's current room only after the database transaction commits. Configure `/nadia_nanny` to set the desired threshold (suggest 25). This is fictional roleplay, not real childcare.
+
+## Improvements
+
+- Guild-specific prompt, chat history, jobs, rooms, settings, albums and reference images; Maison Élise receives no Solace context. Nia is recognized in both; Sly's father relationship is only provided in Solace.
+- Everyone can call Nadia by name and request household tasks in Maison Élise. Managers can configure her using slash commands; Nia and Sly retain Solace management permissions.
+- 3-minute same-user, same-channel follow-up window; replies to Nadia are recognized as follow-ups.
+- Natural chore announcements with no 'simulated' phrasing in ordinary user-facing job messages. Task stages remain fictional; no real appliances are controlled.
+- Wider international menu persona; no 'darling' address.
+- Global slash commands copied/synced to both guilds in `setup_hook`.
+
+## Deploy/test checklist
+
+1. Back up the current NADIA `main.py` and database. Stop duplicate Render instances.
+2. Invite NADIA to Maison Élise and enable Discord Message Content Intent.
+3. Add the new Render environment variables. **Do not post connection strings or bot tokens in Discord.**
+4. Replace `main.py` in the NADIA GitHub repo with the included file; keep `requirements.txt` and `Procfile`.
+5. Deploy to staging and check Render logs for command sync in both guilds.
+6. In each server run `/nadia_rooms` and `/nadia_status`; test `Nadia, start the laundry` and the subsequent progress update.
+7. Test a follow-up without repeating Nadia's name in the same channel within three minutes.
+8. Test Maison privacy with questions about Nyla's father and attempts to retrieve Solace photos. Test commands in both servers.
+9. Only after reviewing Nyla's live state and backup, configure `NYLA_DATABASE_URL`, set `/nadia_nanny threshold:25` in Solace, and use Nyla's TEST `/test_needs` for a supervised care test.
+
+## Important caveats
+
+- No real-world chores or medical care are performed.
+- Automatic Nyla caregiving requires database credentials with read/write access to Nyla's schema. Avoid granting broad permissions if a restricted database role can be used.
+- This update does **not** change Nyla's own Discord bot to multi-household mode. That remains a separate update. Do not invite Nyla to Maison Élise yet.
+- Discord progress delivery may be lost if Render crashes after a DB stage advance and before a message is sent. No guarantee of exactly-once messages.
+- The 3-minute follow-up window is held in memory and resets on restart; persisted AI chat history remains in PostgreSQL.
