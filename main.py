@@ -258,15 +258,19 @@ def addressed_to_nadia(message, bot_user):
     reply=bool(referenced and getattr(getattr(referenced,'author',None),'id',None)==getattr(bot_user,'id',None))
     return named or reply
 
-def should_reply(message, bot_user, quiet):
-    """No passive followups. Explicit addressing only, even if the last turn was Nadia's."""
+def should_reply(message, bot_user, quiet, active=False):
+    """Explicit summons or a recent, context-aware continuation."""
     content=(message.content or '').strip()
     if not content or content.startswith('!'): return False
     addressed=addressed_to_nadia(message,bot_user)
     if quiet:
         return bool(addressed and RESUME.search(content) and not PRIVACY.search(content))
     if OTHER_ADDRESSEE.search(content) and not WAKE.search(content): return False
-    return bool(addressed)
+    if addressed: return True
+    if active and not message.mentions and not OTHER_ADDRESSEE.search(content):
+        # A question or a short response to an active scene is a continuation.
+        return bool('?' in content or re.match(r"^(?:yes|no|okay|ok|alright|sure|please|go ahead|how|what|is|am|can|should|i'm|im)\b", content, re.I))
+    return False
 
 def polish(text):
     text=EM_DASH.sub(', ',text or '')
@@ -281,7 +285,8 @@ async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, mes
          '\nHousehold note: '+str(notes or '')[:1000]+
          '\nRecent dialogue includes different speakers. Respond to the CURRENT speaker, not everyone in the scene. '+
          'Never leak information across households. In Solace labor scenes, Nadia is the established qualified midwife, not a bystander. Remember Nyla is unborn until birth is explicitly established. Preserve continuity across the entire scene and never contradict a previously established exam. Ask consent before examinations. Do not assert exact dilation before the fictional exam. '+
-         'Only the existing task engine can start chores. If a request is not executed by code, do not claim it happened.')
+         'Only the existing task engine can start chores. If a request is not executed by code, do not claim it happened. '+
+         'In fictional medical scenes, once Nia herself consents to an examination, narrate the assessment and give a clear specific fictional finding rather than vague reassurance. Keep the finding consistent with earlier scene results. When asked for results of a completed exam, answer immediately with the actual fictional finding and next step. Do not repeatedly request consent or evade the question. Do not treat Sly consenting as Nia consenting. Clinical results are fictional story details, not real diagnostic measurements.')
     messages=[{'role':'system','content':sys}]
     for role,actor,content in rows:
         messages.append({'role':'assistant' if role=='assistant' else 'user',
@@ -360,7 +365,14 @@ async def handle_household_message(message: discord.Message):
             return
         await asyncio.to_thread(set_privacy, db, gid, cid, message.author.id, False)
         quiet = False
-    if not should_reply(message, bot.user, quiet):
+    # Remember all channel dialogue for continuity, without responding to everyone.
+    # Recent Nadia activity authorizes natural follow-ups for five minutes.
+    recent = await asyncio.to_thread(db, '''SELECT created_at FROM nadia_scene_memory
+        WHERE guild_id=%s AND channel_id=%s AND role='assistant'
+        ORDER BY id DESC LIMIT 1''', (gid,cid), True)
+    active = bool(recent and (datetime.now(timezone.utc)-recent[0][0]).total_seconds()<300)
+    if not should_reply(message, bot.user, quiet, active):
+        await asyncio.to_thread(save_scene,db,gid,cid,message.author.id,'user',message.content)
         return
     if PRIVACY.search(message.content):
         if message.author.id in (MOMMY_ID, DADDY_ID) or message.author.guild_permissions.manage_guild:
