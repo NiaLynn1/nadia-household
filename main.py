@@ -229,8 +229,69 @@ CREATE INDEX IF NOT EXISTS nadia_scene_memory_lookup
  ON nadia_scene_memory(guild_id,channel_id,id DESC);
 '''
 
+CLINICAL_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS nadia_clinical_scene (
+ guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL,
+ patient_id BIGINT NOT NULL, dilation_cm NUMERIC(3,1),
+ assessment TEXT NOT NULL DEFAULT '',
+ assessed_at TIMESTAMPTZ,
+ PRIMARY KEY (guild_id,channel_id,patient_id)
+);
+CREATE TABLE IF NOT EXISTS nadia_clinical_observations (
+ id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL,
+ channel_id BIGINT NOT NULL, patient_id BIGINT NOT NULL,
+ speaker_id BIGINT NOT NULL, observation TEXT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS nadia_clinical_obs_lookup
+ ON nadia_clinical_observations(guild_id,channel_id,patient_id,id DESC);
+'''
+
+def clinical_context(db, gid, channel, patient):
+    record=db('''SELECT dilation_cm,assessment,assessed_at FROM nadia_clinical_scene
+       WHERE guild_id=%s AND channel_id=%s AND patient_id=%s''',
+       (gid,channel,patient),True)
+    observations=db('''SELECT observation FROM nadia_clinical_observations
+       WHERE guild_id=%s AND channel_id=%s AND patient_id=%s
+       ORDER BY id DESC LIMIT 8''',(gid,channel,patient),True)
+    result='Recorded fictional clinical state for this scene: '
+    if record:
+        dilation,assessment,at=record[0]
+        result+=f'Last documented dilation: {dilation} cm. ' if dilation is not None else 'No measured dilation documented. '
+        result+=f'Last assessment: {assessment[:350]}. '
+    else:
+        result+='No completed measured examination recorded. '
+    if observations:
+        result+='Recent observations (newest first): '+'; '.join(r[0][:180] for r in observations)
+    return result
+
+def record_observation(db,gid,channel,patient,speaker,content):
+    # Only dialogue relevant to this fictional clinical scene, no cross-guild data.
+    if re.search(r'\\b(?:contraction|dilat|cervix|water broke|water breaking|baby|nyla|pool|push|pain|pressure|heartbeat|kick|labor|labour)\\b',content,re.I):
+        db('''INSERT INTO nadia_clinical_observations
+        (guild_id,channel_id,patient_id,speaker_id,observation)
+        VALUES(%s,%s,%s,%s,%s)''',(gid,channel,patient,speaker,content[:700]))
+
+def record_assessment(db,gid,channel,patient,answer):
+    # Record only an explicit measurement narrated as a completed examination.
+    if not re.search(r'\\b(?:exam|check|assessment|reassessment|cervix|dilat)\\b',answer,re.I):
+        return
+    match=re.search(r'\\b(?:dilat(?:ed|ion)?(?:\\s+(?:to|at|about|around))?|cervix\\s+(?:is|at|measures))\\s*[:]?\\s*(?:about|around|approximately)?\\s*(10(?:\\.0)?|[0-9](?:\\.[0-9])?)\\s*(?:cm|centimeters?)\\b',answer,re.I)
+    if not match:
+        match=re.search(r'\\b(10(?:\\.0)?|[0-9](?:\\.[0-9])?)\\s*(?:cm|centimeters?)\\s+dilat',answer,re.I)
+    if not match: return
+    cm=float(match.group(1))
+    if not 0<=cm<=10: return
+    db('''INSERT INTO nadia_clinical_scene
+      (guild_id,channel_id,patient_id,dilation_cm,assessment,assessed_at)
+      VALUES(%s,%s,%s,%s,%s,NOW())
+      ON CONFLICT(guild_id,channel_id,patient_id)
+      DO UPDATE SET dilation_cm=EXCLUDED.dilation_cm,
+        assessment=EXCLUDED.assessment,assessed_at=NOW()''',
+      (gid,channel,patient,cm,answer[:700]))
+
 def install_schema(db):
-    for sql in SCHEMA.strip().split(';'):
+    for sql in (SCHEMA + CLINICAL_SCHEMA).strip().split(';'):
         if sql.strip(): db(sql)
 
 def privacy_enabled(db, gid, channel):
@@ -281,12 +342,13 @@ def polish(text):
 async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, message, household_system, birth_mode, notes):
     """Shared channel memory, but isolated by guild and channel. Caller handles permissions."""
     rows=await asyncio.to_thread(scene_history,db,gid,channel_id)
-    sys=(PERSONA+'\n'+household_system+'\nCurrent birth mode: '+str(birth_mode)+
+    clinical=await asyncio.to_thread(clinical_context,db,gid,channel_id,MOMMY_ID) if gid==SOLACE_GUILD_ID and birth_mode=='labor' else ''
+    sys=(PERSONA+'\n'+clinical+'\n'+household_system+'\nCurrent birth mode: '+str(birth_mode)+
          '\nHousehold note: '+str(notes or '')[:1000]+
          '\nRecent dialogue includes different speakers. Respond to the CURRENT speaker, not everyone in the scene. '+
          'Never leak information across households. In Solace labor scenes, Nadia is the established qualified midwife, not a bystander. Remember Nyla is unborn until birth is explicitly established. Preserve continuity across the entire scene and never contradict a previously established exam. Ask consent before examinations. Do not assert exact dilation before the fictional exam. '+
          'Only the existing task engine can start chores. If a request is not executed by code, do not claim it happened. '+
-         'In fictional medical scenes, once Nia herself consents to an examination, narrate the assessment and give a clear specific fictional finding rather than vague reassurance. Keep the finding consistent with earlier scene results. When asked for results of a completed exam, answer immediately with the actual fictional finding and next step. Do not repeatedly request consent or evade the question. Do not treat Sly consenting as Nia consenting. Clinical results are fictional story details, not real diagnostic measurements.')
+         'In fictional medical scenes, once Nia herself consents to an examination, narrate the assessment and give a clear specific fictional finding rather than vague reassurance. Keep the finding consistent with earlier scene results. When asked for results of a completed exam, answer immediately with the actual fictional finding and next step. If a completed exam has no numerical finding yet, establish a plausible fictional finding explicitly during the consented narrated exam and give its measurement in cm. Once recorded, reuse the recorded value until another consented exam changes it. Do not pretend a new examination occurred just because someone asks how dilated Nia is. Never turn vague reassurance into a medical measurement. Avoid telling Nia to wait for the urge to push before using the birthing pool; water immersion for comfort can be discussed earlier in labor if appropriate to the scene. Do not repeatedly request consent or evade the question. Do not treat Sly consenting as Nia consenting. Clinical results are fictional story details, not real diagnostic measurements.')
     messages=[{'role':'system','content':sys}]
     for role,actor,content in rows:
         messages.append({'role':'assistant' if role=='assistant' else 'user',
@@ -295,6 +357,9 @@ async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, mes
     result=await ai.chat.completions.create(model=model,messages=messages,max_tokens=350,temperature=0.7)
     answer=polish(result.choices[0].message.content or '')
     if not answer: answer='Give me a moment, please.'
+    if gid==SOLACE_GUILD_ID and birth_mode=='labor':
+        await asyncio.to_thread(record_observation,db,gid,channel_id,MOMMY_ID,user_id,message)
+        await asyncio.to_thread(record_assessment,db,gid,channel_id,MOMMY_ID,answer)
     await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'user',message)
     await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'assistant',answer)
     return answer[:1900]
