@@ -90,6 +90,135 @@ def init_db():
     for gid in HOUSEHOLDS:
         db('INSERT INTO nadia_settings (guild_id) VALUES (%s) ON CONFLICT DO NOTHING', (gid,))
 
+# Quiet, durable fictional follow-through. No task IDs or progress messages in chat.
+FOLLOWUP_SCHEMA = """CREATE TABLE IF NOT EXISTS nadia_followups (
+ id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL,
+ requester_id BIGINT NOT NULL, description TEXT NOT NULL, completion_text TEXT NOT NULL,
+ due_at TIMESTAMPTZ NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ,
+ sending_at TIMESTAMPTZ, attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS nadia_followups_due ON nadia_followups(status,due_at);
+"""
+def init_service_promises():
+    for stmt in FOLLOWUP_SCHEMA.strip().split(';'):
+        if stmt.strip(): db(stmt)
+    # Preserve previous pending deliveries without recreating them.
+    db("""CREATE TABLE IF NOT EXISTS nadia_service_promises (
+        id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL,
+        requester_id BIGINT NOT NULL, item TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        due_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        UNIQUE(guild_id,channel_id,requester_id,item,status)
+    )""")
+
+async def identify_commitments(ai, model, answer):
+    # Extract promises from Nadia's actual reply, not from the user's wish list.
+    # Explicit exclusions prevent automatic fictional clinical procedures or guarantees.
+    if not re.search(r"\\b(?:I'll|I’ll|I will|let me|I'm going to|I’m going to|I'll be back|I’ll be back)\\b",answer,re.I):
+        return []
+    instructions = """Extract explicit, concrete commitments that the SPEAKER (Nadia) made
+in her own response. Return JSON object {"tasks":[{"description":"short specific action",
+"completion_text":"natural first-person message Nadia would say when the action is finished",
+"minutes":2}]}.
+Only include safe, routine, in-story household actions, fetching items, meals, cleaning,
+checking back after a stated interval, or providing a promised informational update.
+For long chores choose a reasonable fictional duration 3-30 minutes; quick fetching 1-3.
+If no concrete actionable commitment, tasks must be [].
+Never include speculative offers, conditional promises, jokes, vague reassurance, or
+things already completed. Never schedule medical exams, birth, treatment, medicine,
+clinical results, fetal monitoring, emergencies, real-world external actions, or any
+promise that requires user consent or unavailable information.
+The completion message must never assert a real-world physical action took place.
+Be brief and conversational, no task numbers, no progress tracking, no forced sass.
+Do not invent new tasks or alter the commitment."""
+    try:
+        response=await ai.chat.completions.create(
+            model=model,temperature=0,max_tokens=450,
+            response_format={"type":"json_object"},
+            messages=[{"role":"system","content":instructions},
+                      {"role":"user","content":answer[:1900]}])
+        data=json.loads(response.choices[0].message.content or '{}')
+        tasks=data.get('tasks',[])
+        if not isinstance(tasks,list):return []
+        clean=[]
+        for item in tasks[:5]:
+            if not isinstance(item,dict):continue
+            desc=str(item.get('description','')).strip()[:220]
+            line=str(item.get('completion_text','')).strip()[:800]
+            try: mins=max(1,min(30,int(item.get('minutes',2))))
+            except (TypeError,ValueError):mins=2
+            if desc and line:clean.append((desc,line,mins))
+        return clean
+    except Exception:
+        log.exception('Could not extract Nadia commitments')
+        return []
+
+def save_commitments(gid,cid,uid,commitments):
+    for desc,line,minutes in commitments:
+        # Prevent duplicates while a promise is still pending.
+        db("""INSERT INTO nadia_followups
+          (guild_id,channel_id,requester_id,description,completion_text,due_at)
+          SELECT %s,%s,%s,%s,%s,NOW()+(%s * INTERVAL '1 minute')
+          WHERE NOT EXISTS (
+           SELECT 1 FROM nadia_followups WHERE guild_id=%s AND channel_id=%s
+            AND requester_id=%s AND lower(description)=lower(%s)
+            AND status IN ('pending','sending'))""",
+            (gid,cid,uid,desc,line,minutes,gid,cid,uid,desc))
+
+def pending_services(gid,cid,uid):
+    rows=db("""SELECT description FROM nadia_followups
+      WHERE guild_id=%s AND channel_id=%s AND requester_id=%s
+      AND status IN ('pending','sending') ORDER BY due_at LIMIT 12""",
+      (gid,cid,uid),True)
+    old=db("""SELECT item FROM nadia_service_promises WHERE guild_id=%s
+      AND channel_id=%s AND requester_id=%s AND status='pending'""",
+      (gid,cid,uid),True)
+    return ', '.join([r[0] for r in rows]+[r[0] for r in old]) or 'none'
+
+def claim_due_followups():
+    with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,guild_id,channel_id,requester_id,completion_text
+              FROM nadia_followups WHERE
+              (status='pending' AND due_at<=NOW()) OR
+              (status='sending' AND sending_at<NOW()-INTERVAL '3 minutes')
+              ORDER BY due_at LIMIT 20 FOR UPDATE SKIP LOCKED""")
+            rows=cur.fetchall()
+            for fid,*_ in rows:
+                cur.execute("""UPDATE nadia_followups SET status='sending',
+                  sending_at=NOW(),attempts=attempts+1 WHERE id=%s""",(fid,))
+    return rows
+
+def finish_followup(fid):
+    db("""UPDATE nadia_followups SET status='completed',completed_at=NOW()
+      WHERE id=%s""",(fid,))
+
+def retry_followup(fid):
+    db("""UPDATE nadia_followups SET status='pending',
+      due_at=NOW()+INTERVAL '1 minute' WHERE id=%s""",(fid,))
+
+def claim_legacy_services():
+    # Legacy service promises still receive their tea/blanket/water, but
+    # are acknowledged only after Discord accepts the message.
+    with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,guild_id,channel_id,requester_id,item
+             FROM nadia_service_promises WHERE status='pending' AND due_at<=NOW()
+             ORDER BY due_at LIMIT 20 FOR UPDATE SKIP LOCKED""")
+            return cur.fetchall()
+
+def finish_legacy_service(fid):
+    db("""UPDATE nadia_service_promises SET status='completed',completed_at=NOW()
+      WHERE id=%s""",(fid,))
+
+LEGACY_LINES={
+ 'tea':'Nia, here is your tea, freshly made and warm. Careful, the cup is hot.',
+ 'blanket':'Nia, here is that warm blanket. Let me tuck it around your shoulders.',
+ 'water':'Here is your glass of water, Nia. I put it within easy reach.'
+}
+
 def audit(event, details):
     db('INSERT INTO nadia_events(guild_id,event_type,details) VALUES (%s,%s,%s)', (guild_id(),event,details[:1800]))
 
@@ -123,6 +252,7 @@ async def set_interaction_household(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     log.info('NADIA online as %s', bot.user)
+    await asyncio.to_thread(init_service_promises)
     if not daily_housekeeping.is_running():
         daily_housekeeping.start()
     if not nadia_job_clock.is_running():
@@ -172,7 +302,7 @@ async def clean(interaction: discord.Interaction):
     if await reject(interaction, True): return
     today = datetime.now(timezone.utc).date().isoformat()
     jid,target,stage,_=await asyncio.to_thread(start_job,'general','General household cleaning',interaction.user.id,interaction.channel_id)
-    await interaction.response.send_message(f'🏡 Started cleaning job #{jid}. Updates in <#{target}>.')
+    await interaction.response.send_message('Of course. I’ll take care of the cleaning.')
 
 @bot.tree.command(name='nadia_birth', description='Set the fictional birth-story mode; never starts labor automatically')
 @app_commands.choices(mode=[app_commands.Choice(name='Waiting',value='waiting'),app_commands.Choice(name='Labor scene (parent-initiated)',value='labor'),app_commands.Choice(name='Postpartum (parent-initiated)',value='postpartum')])
@@ -211,7 +341,7 @@ OTHER_ADDRESSEE = re.compile(r"^\s*(?:hey\s+|hi\s+|hello\s+)?(?:sly|baby|babe|lo
 EM_DASH = re.compile('[\u2014\u2013]')
 FILLER = re.compile(r"\b(?:i'm here (?:for you|if you need anything)|you(?:'re| are) doing amazing|let me know if you need anything)\b", re.I)
 
-PERSONA = '''You are Nadia St. Clair, a fictional 34-year-old Black woman from Charleston. You are one person with three established roles: the household manager and accomplished international private chef, Nia's qualified midwife for fictional birth scenes, and the family's primary care physician in fictional medical scenes. You are competent, perceptive, poised, discreet, warm, dryly funny when the moment allows, and naturally sassy without insulting anyone. Never perform a stereotype, force slang, make corny one-liners, or call anyone darling. Address Nia as Nia. In Solace, address Sly as Sly. In Maison Élise, never mention or imply Solace relationships. Speak like a real person in conversation, usually one to four sentences. No em dashes or en dashes. Avoid scripted reassurance, canned empathy, repetitive praise, unnecessary follow-up questions, and closing offers of assistance. Read the room. Silence is often appropriate. Maintain continuity with previously established fictional events. Do not claim an exam or a medical finding happened until the roleplay establishes consent and the examination. For a requested fictional assessment, explain briefly, request consent if needed, then proceed in-character when consent is given. Do not invent precise dilation, fetal measurements, or diagnoses without a narrated assessment. Clinical scenes are roleplay, not real medical treatment. For genuine real-world symptoms, recommend appropriate licensed medical care. Do not invent completed household tasks, real-world physical actions, notifications, or database changes. Never initiate labor or announce a birth independently.'''
+PERSONA = '''You are Nadia St. Clair, a fictional 34-year-old Black woman from Charleston. You are one person with three established roles: the household manager and accomplished international private chef, Nia's qualified midwife for fictional birth scenes, and the family's primary care physician in fictional medical scenes. You are competent, perceptive, poised, discreet, warm, dryly funny when the moment allows, and naturally sassy without insulting anyone. Never perform a stereotype, force slang, make corny one-liners, or call anyone darling. Address Nia as Nia. In Solace, address Sly as Sly. In Maison Élise, never mention or imply Solace relationships. Speak like a real person in conversation, usually one to four sentences. No em dashes or en dashes. Avoid scripted reassurance, canned empathy, repetitive praise, unnecessary follow-up questions, and closing offers of assistance. Read the room. Silence is often appropriate. Maintain continuity with previously established fictional events. Do not claim an exam or a medical finding happened until the roleplay establishes consent and the examination. For a requested fictional assessment, explain briefly, request consent if needed, then proceed in-character when consent is given. Do not invent precise dilation, fetal measurements, or diagnoses without a narrated assessment. Clinical scenes are roleplay, not real medical treatment. For genuine real-world symptoms, recommend appropriate licensed medical care. Do not invent completed household tasks, real-world physical actions, notifications, or database changes. When you make a specific, safe household promise, a private follow-through scheduler handles it. Do not narrate task IDs or progress updates. Speak naturally and return only when finished. Never promise automatic medical procedures or actual external actions. Do not claim an item was delivered before that notice. If asked about a pending item, acknowledge the delay and its pending status; do not make a new promise that resets the clock. Never initiate labor or announce a birth independently.'''
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS nadia_conversation_control (
@@ -343,11 +473,12 @@ async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, mes
     """Shared channel memory, but isolated by guild and channel. Caller handles permissions."""
     rows=await asyncio.to_thread(scene_history,db,gid,channel_id)
     clinical=await asyncio.to_thread(clinical_context,db,gid,channel_id,MOMMY_ID) if gid==SOLACE_GUILD_ID and birth_mode=='labor' else ''
-    sys=(PERSONA+'\n'+clinical+'\n'+household_system+'\nCurrent birth mode: '+str(birth_mode)+
+    services=await asyncio.to_thread(pending_services,gid,channel_id,user_id)
+    sys=(PERSONA+'\nPending in-story service promises to the current speaker: '+services+'\n'+clinical+'\n'+household_system+'\nCurrent birth mode: '+str(birth_mode)+
          '\nHousehold note: '+str(notes or '')[:1000]+
          '\nRecent dialogue includes different speakers. Respond to the CURRENT speaker, not everyone in the scene. '+
          'Never leak information across households. In Solace labor scenes, Nadia is the established qualified midwife, not a bystander. Remember Nyla is unborn until birth is explicitly established. Preserve continuity across the entire scene and never contradict a previously established exam. Ask consent before examinations. Do not assert exact dilation before the fictional exam. '+
-         'Only the existing task engine can start chores. If a request is not executed by code, do not claim it happened. '+
+         'Only the existing task engine can start chores. Household commitments can be scheduled for fictional completion. Do not claim a real-world action happened. '+
          'In fictional medical scenes, once Nia herself consents to an examination, narrate the assessment and give a clear specific fictional finding rather than vague reassurance. Keep the finding consistent with earlier scene results. When asked for results of a completed exam, answer immediately with the actual fictional finding and next step. If a completed exam has no numerical finding yet, establish a plausible fictional finding explicitly during the consented narrated exam and give its measurement in cm. Once recorded, reuse the recorded value until another consented exam changes it. Do not pretend a new examination occurred just because someone asks how dilated Nia is. Never turn vague reassurance into a medical measurement. Avoid telling Nia to wait for the urge to push before using the birthing pool; water immersion for comfort can be discussed earlier in labor if appropriate to the scene. Do not repeatedly request consent or evade the question. Do not treat Sly consenting as Nia consenting. Clinical results are fictional story details, not real diagnostic measurements.')
     messages=[{'role':'system','content':sys}]
     for role,actor,content in rows:
@@ -362,6 +493,8 @@ async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, mes
         await asyncio.to_thread(record_assessment,db,gid,channel_id,MOMMY_ID,answer)
     await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'user',message)
     await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'assistant',answer)
+    commitments=await identify_commitments(ai,model,answer)
+    if commitments: await asyncio.to_thread(save_commitments,gid,channel_id,user_id,commitments)
     return answer[:1900]
 
 
@@ -564,7 +697,7 @@ def advance_due_jobs():
                 if next_idx>=len(stages):
                     cur.execute('''UPDATE nadia_jobs SET status='completed',stage_index=%s,
                         finished_at=NOW() WHERE id=%s''',(next_idx,jid))
-                    notices.append((channel,f'✅ **Nadia finished:** {description}. Everything is finished and put away.'))
+                    notices.append((channel,f'All done. I’ve finished {description.rstrip(".")}.'))
                 else:
                     # Schedule from now rather than compressing multiple missed stages after a restart.
                     label,minutes=stages[next_idx]
@@ -651,7 +784,7 @@ async def ops_request(message,body):
     room=identify_room(body,kind)
     jid,target,stage,due=await asyncio.to_thread(start_job,kind,body,message.author.id,message.channel.id,room)
     who='Nia' if message.author.id==MOMMY_ID else ('Sly' if is_solace() and message.author.id==DADDY_ID else message.author.display_name)
-    await message.reply(f'Of course, {who}. I’ve started **household task #{jid}** and will handle every stage automatically. Updates will appear in <#{target}>.',mention_author=False)
+    await message.reply(f'Of course, {who}. I’ll take care of that.',mention_author=False)
     dest=bot.get_channel(target)
     if dest:
         await dest.send(f'🏡 **Nadia is getting started**\nTask: {body[:250]}\nFirst stage: **{stage}**. I’ll post updates as the work progresses.')
@@ -668,6 +801,29 @@ async def nadia_job_clock():
                 notices.extend(await asyncio.to_thread(advance_due_jobs))
             finally:
                 _guild_context.reset(token)
+        # Quiet automatic follow-through; confirm delivery only after send succeeds.
+        for fid,gid,cid,uid,line in await asyncio.to_thread(claim_due_followups):
+            channel=bot.get_channel(cid)
+            if channel is None:
+                await asyncio.to_thread(retry_followup,fid)
+                continue
+            try:
+                await channel.send(line)
+                await asyncio.to_thread(finish_followup,fid)
+                await asyncio.to_thread(save_scene,db,gid,cid,uid,'assistant',line)
+            except discord.HTTPException:
+                await asyncio.to_thread(retry_followup,fid)
+                log.exception('Could not post Nadia follow-up')
+        for fid,gid,cid,uid,item in await asyncio.to_thread(claim_legacy_services):
+            channel=bot.get_channel(cid)
+            if not channel:continue
+            line=LEGACY_LINES.get(item)
+            if not line:continue
+            try:
+                await channel.send(line)
+                await asyncio.to_thread(finish_legacy_service,fid)
+                await asyncio.to_thread(save_scene,db,gid,cid,uid,'assistant',line)
+            except discord.HTTPException:log.exception('Could not post legacy service')
         for channel_id,line in notices:
             channel=bot.get_channel(channel_id)
             if channel:
