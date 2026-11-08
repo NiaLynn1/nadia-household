@@ -578,6 +578,8 @@ async def handle_household_message(message: discord.Message):
             await message.reply('Of course. I’ll give you some space.', mention_author=False)
         return
     try:
+        if await handle_reference_upload(message):
+            return
         if addressed and CAPTURE_REQUEST.search(message.content):
             if not client_ai:
                 await message.reply('I can take the picture once my image service is configured.',mention_author=False)
@@ -604,6 +606,88 @@ async def handle_household_message(message: discord.Message):
         log.exception('Nadia conversation failed')
         await message.reply('One moment. I’m having trouble with that request.', mention_author=False)
 
+
+# Natural-language image references. Explicit save intent only; never auto-store uploads.
+REFERENCE_SAVE = re.compile(
+    r"\b(?:add|save|store|log|register|keep)\b.{0,65}\b(?:reference|visual library|photo reference)\b"
+    r"|\b(?:reference photo|reference image)\b.{0,35}\b(?:add|save|store|log)\b", re.I)
+REFERENCE_TYPES = {
+    'person':'person','people':'group','group':'group','family':'group',
+    'couple':'group','room':'room','space':'room','location':'room',
+    'object':'memory','item':'memory','memory':'memory','pet':'person'
+}
+def parse_reference_instruction(content):
+    """Accept 'add to reference: person Nia', 'save as room: nursery',
+    'add these to reference, group: Nia and Sly' and similar."""
+    if not REFERENCE_SAVE.search(content):
+        return None
+    # Prefer explicitly named type; never guess the identities in a photo.
+    m = re.search(
+        r"\b(person|people|group|family|couple|room|space|location|object|item|memory|pet)\b"
+        r"\s*(?:reference)?\s*(?:named|called|of|for|:|=|-)?\s*"
+        r"([\w][^\n;]{0,120})",content,re.I)
+    if not m:
+        m = re.search(
+            r"\b(?:as|under)\s+(person|people|group|family|couple|room|space|location|object|item|memory|pet)"
+            r"\s*[:=-]?\s*([^\n;]{1,120})",content,re.I)
+    if not m:
+        return ('missing', '', '')
+    kind=REFERENCE_TYPES[m.group(1).lower()]
+    name=m.group(2).strip(" .,:;!?\"' ")
+    name=re.sub(r"\s+(?:please|thank you|thanks|for future captures|as a reference)\s*$",'',name,flags=re.I).strip()
+    if not name or name.lower() in ('reference','photo','picture','image','photos','pictures','images'):
+        return ('missing','','')
+    return kind,normalized_name(name),''
+
+def store_uploaded_references(gid,kind,name,photos):
+    # One transaction ensures subject creation and all photos stay together.
+    with psycopg.connect(DATABASE_URL,connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO nadia_visual_subjects(guild_id,kind,name,description)
+                VALUES(%s,%s,%s,'') ON CONFLICT(guild_id,kind,name) DO NOTHING""",
+                (gid,kind,name))
+            cur.execute("""SELECT id FROM nadia_visual_subjects
+                WHERE guild_id=%s AND kind=%s AND lower(name)=lower(%s)""",(gid,kind,name))
+            row=cur.fetchone()
+            if not row:raise RuntimeError('Could not resolve visual subject')
+            for raw,mime in photos:
+                cur.execute("""INSERT INTO nadia_visual_photos
+                    (guild_id,subject_id,image_bytes,mime_type,angle)
+                    VALUES(%s,%s,%s,%s,%s)""",(gid,row[0],raw,mime,'Uploaded by natural-language request'))
+
+async def handle_reference_upload(message):
+    if not REFERENCE_SAVE.search(message.content or ''):
+        return False
+    if not message.attachments:
+        await message.reply('Attach the photo and tell me its category and name, like “Nadia, add to reference: person Nia.”',mention_author=False)
+        return True
+    if not (message.author.id == MOMMY_ID or
+            (is_solace() and message.author.id == DADDY_ID) or
+            message.author.guild_permissions.manage_guild):
+        await message.reply('Only authorized household managers can save reference photos.',mention_author=False)
+        return True
+    instruction=parse_reference_instruction(message.content)
+    if not instruction or instruction[0]=='missing':
+        await message.reply('Tell me the category and name: person, group, room, or object. For example, “Nadia, add to reference: group Nia and Sly.”',mention_author=False)
+        return True
+    kind,name,_=instruction
+    try:
+        if len(message.attachments)>8:
+            raise ValueError('Please upload up to eight photos at a time.')
+        photos=[]
+        for attachment in message.attachments:
+            raw=await read_reference(attachment)
+            photos.append((raw,attachment.content_type))
+        await asyncio.to_thread(store_uploaded_references,message.guild.id,kind,name,photos)
+        await message.reply(
+            f'Saved {len(photos)} reference photo{"s" if len(photos)!=1 else ""} for **{name}** ({kind}). I’ll use them for future captures.',
+            mention_author=False)
+    except ValueError as exc:
+        await message.reply(str(exc),mention_author=False)
+    except Exception:
+        log.exception('Natural reference upload failed')
+        await message.reply('I couldn’t save those references. Please try again.',mention_author=False)
+    return True
 
 # ---------- Solace household operations ----------
 # Every duration is simulated; no real appliances or healthcare services are controlled.
@@ -920,6 +1004,7 @@ async def nadia_clinic_visit(interaction:discord.Interaction,concern:str):
 MAX_REFERENCE_BYTES = 5 * 1024 * 1024
 PHOTO_KIND = [app_commands.Choice(name='Person', value='person'),
               app_commands.Choice(name='Room', value='room'),
+              app_commands.Choice(name='Group', value='group'),
               app_commands.Choice(name='Memory / Object', value='memory')]
 
 def normalized_name(name):
