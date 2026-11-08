@@ -127,7 +127,7 @@ async def on_ready():
         daily_housekeeping.start()
     if not nadia_job_clock.is_running():
         nadia_job_clock.start()
-    if NYLA_DATABASE_URL and not nadia_nyla_watch.is_running():
+    if NYLA_DATABASE_URL and os.getenv('NADIA_ENABLE_NYLA_CARE', 'false').lower() == 'true' and not nadia_nyla_watch.is_running():
         nadia_nyla_watch.start()
     for gid in HOUSEHOLDS:
         guild=bot.get_guild(gid)
@@ -141,12 +141,14 @@ async def status(interaction: discord.Interaction):
     if await reject(interaction): return
     skip, clean, birth, threshold, _ = await asyncio.to_thread(setting)
     today = datetime.now(timezone.utc).date().isoformat()
-    await interaction.response.send_message(
-        f'🏡 **Nadia St. Clair — {house_name()}**\nBirth story: **{birth}**\n'
-        f'Daily housekeeping: **{"completed" if clean==today else "pending"}**\n'
-        f'Dinner: **{"Nia has it" if skip==today else "available by request"}**\n'
-        f'Nyla backup threshold: **{threshold}%** (Solace integration only)\n' if is_solace() else ''
-        'Scene captures: **available** with an image API key.', ephemeral=True)
+    lines = [f'🏡 **Nadia St. Clair | {house_name()}**']
+    if is_solace():
+        lines += [f'Birth story: **{birth}**',
+                  f'Housekeeping: **{"completed" if clean == today else "pending"}**',
+                  f'Dinner: **{"Nia has it" if skip == today else "available by request"}**',
+                  f'Nyla backup threshold: **{threshold}%**']
+    lines.append('Scene captures: available with an image API key.')
+    await interaction.response.send_message('\n'.join(lines), ephemeral=True)
 
 @bot.tree.command(name='nadia_dinner', description='Tell Nadia you have dinner or request a menu')
 @app_commands.describe(plan='Choose who handles dinner today')
@@ -198,15 +200,101 @@ async def note(interaction: discord.Interaction, detail: str):
     await asyncio.to_thread(audit,'household_note',f'updated by {interaction.user.id}')
     await interaction.response.send_message('Your household note is saved.',ephemeral=True)
 
-PERSONA = ("You are Nadia St. Clair, a fictional 34-year-old African-American woman from Charleston, South Carolina. "
- "You are warm, capable, polished, practical, quietly funny and discreet. Address Nia as Nia; never call anyone darling. "
- "Your culinary repertoire is international and versatile: Caribbean, Italian, French, Mediterranean, Mexican, "
- "East and South Asian, African, Southern American, vegetarian and more. Rotate cuisines, ingredients and techniques "
- "rather than repeatedly recommending regional Charleston or Lowcountry food or using the word Lowcountry in meal names. "
- "You are a fictional household manager, private chef, nanny and wellness companion. Speak naturally in character "
- "about household tasks, without mechanical disclaimers. Never claim control of physical appliances or real medical treatment. "
- "For real medical emergencies advise appropriate professional help. Never initiate a labor story on your own. "
- "Only confirm a scheduled task if the actual task engine has returned a job ID. Keep answers concise.")
+"""Nadia conversational intelligence layer. No new slash commands.
+Import into the existing main.py as documented in README.
+"""
+
+WAKE = re.compile(r"(?<!\w)nadia(?:['’]s)?(?!\w)", re.I)
+PRIVACY = re.compile(r"\b(?:give (?:us|me) (?:some )?(?:privacy|space)|leave (?:us|me) alone|stop (?:talking|responding|replying)|stay (?:quiet|silent)|don't (?:respond|reply|interrupt)|do not (?:respond|reply|interrupt)|we(?:'|’)ll call you|go downstairs)\b", re.I)
+RESUME = re.compile(r"\b(?:nadia[,! ]+)?(?:come back|we need you|i need you|you can speak|join us|resume|can you help|please help|check on|come here)\b", re.I)
+OTHER_ADDRESSEE = re.compile(r"^\s*(?:hey\s+|hi\s+|hello\s+)?(?:sly|baby|babe|love|nia)\b[,!?. ]*", re.I)
+EM_DASH = re.compile('[\u2014\u2013]')
+FILLER = re.compile(r"\b(?:i'm here (?:for you|if you need anything)|you(?:'re| are) doing amazing|let me know if you need anything)\b", re.I)
+
+PERSONA = '''You are Nadia St. Clair, a fictional 34-year-old Black woman from Charleston. You are one person with three established roles: the household manager and accomplished international private chef, Nia's qualified midwife for fictional birth scenes, and the family's primary care physician in fictional medical scenes. You are competent, perceptive, poised, discreet, warm, dryly funny when the moment allows, and naturally sassy without insulting anyone. Never perform a stereotype, force slang, make corny one-liners, or call anyone darling. Address Nia as Nia. In Solace, address Sly as Sly. In Maison Élise, never mention or imply Solace relationships. Speak like a real person in conversation, usually one to four sentences. No em dashes or en dashes. Avoid scripted reassurance, canned empathy, repetitive praise, unnecessary follow-up questions, and closing offers of assistance. Read the room. Silence is often appropriate. Maintain continuity with previously established fictional events. Do not claim an exam or a medical finding happened until the roleplay establishes consent and the examination. For a requested fictional assessment, explain briefly, request consent if needed, then proceed in-character when consent is given. Do not invent precise dilation, fetal measurements, or diagnoses without a narrated assessment. Clinical scenes are roleplay, not real medical treatment. For genuine real-world symptoms, recommend appropriate licensed medical care. Do not invent completed household tasks, real-world physical actions, notifications, or database changes. Never initiate labor or announce a birth independently.'''
+
+SCHEMA = '''
+CREATE TABLE IF NOT EXISTS nadia_conversation_control (
+ guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL,
+ privacy BOOLEAN NOT NULL DEFAULT FALSE,
+ updated_by BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY (guild_id, channel_id)
+);
+CREATE TABLE IF NOT EXISTS nadia_scene_memory (
+ id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, channel_id BIGINT NOT NULL,
+ actor_id BIGINT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS nadia_scene_memory_lookup
+ ON nadia_scene_memory(guild_id,channel_id,id DESC);
+'''
+
+def install_schema(db):
+    for sql in SCHEMA.strip().split(';'):
+        if sql.strip(): db(sql)
+
+def privacy_enabled(db, gid, channel):
+    rows=db('SELECT privacy FROM nadia_conversation_control WHERE guild_id=%s AND channel_id=%s', (gid,channel), True)
+    return bool(rows and rows[0][0])
+
+def set_privacy(db, gid, channel, user, value):
+    db('''INSERT INTO nadia_conversation_control(guild_id,channel_id,privacy,updated_by,updated_at)
+    VALUES(%s,%s,%s,%s,NOW()) ON CONFLICT(guild_id,channel_id) DO UPDATE
+    SET privacy=EXCLUDED.privacy,updated_by=EXCLUDED.updated_by,updated_at=NOW()''', (gid,channel,value,user))
+
+def save_scene(db, gid, channel, actor, role, content):
+    db('INSERT INTO nadia_scene_memory(guild_id,channel_id,actor_id,role,content) VALUES (%s,%s,%s,%s,%s)', (gid,channel,actor,role,content[:3000]))
+
+def scene_history(db, gid, channel, limit=24):
+    return db('''SELECT role,actor_id,content FROM (
+      SELECT id,role,actor_id,content FROM nadia_scene_memory
+      WHERE guild_id=%s AND channel_id=%s ORDER BY id DESC LIMIT %s
+    ) recent ORDER BY id''', (gid,channel,limit), True)
+
+def addressed_to_nadia(message, bot_user):
+    content=message.content or ''
+    named=bool(WAKE.search(content) or (bot_user and bot_user.mentioned_in(message)))
+    referenced=message.reference and message.reference.resolved
+    reply=bool(referenced and getattr(getattr(referenced,'author',None),'id',None)==getattr(bot_user,'id',None))
+    return named or reply
+
+def should_reply(message, bot_user, quiet):
+    """No passive followups. Explicit addressing only, even if the last turn was Nadia's."""
+    content=(message.content or '').strip()
+    if not content or content.startswith('!'): return False
+    addressed=addressed_to_nadia(message,bot_user)
+    if quiet:
+        return bool(addressed and RESUME.search(content) and not PRIVACY.search(content))
+    if OTHER_ADDRESSEE.search(content) and not WAKE.search(content): return False
+    return bool(addressed)
+
+def polish(text):
+    text=EM_DASH.sub(', ',text or '')
+    text=re.sub(r'\s+,', ',', text)
+    text=re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, message, household_system, birth_mode, notes):
+    """Shared channel memory, but isolated by guild and channel. Caller handles permissions."""
+    rows=await asyncio.to_thread(scene_history,db,gid,channel_id)
+    sys=(PERSONA+'\n'+household_system+'\nCurrent birth mode: '+str(birth_mode)+
+         '\nHousehold note: '+str(notes or '')[:1000]+
+         '\nRecent dialogue includes different speakers. Respond to the CURRENT speaker, not everyone in the scene. '+
+         'Never leak information across households. In Solace labor scenes, Nadia is the established qualified midwife, not a bystander. Remember Nyla is unborn until birth is explicitly established. Preserve continuity across the entire scene and never contradict a previously established exam. Ask consent before examinations. Do not assert exact dilation before the fictional exam. '+
+         'Only the existing task engine can start chores. If a request is not executed by code, do not claim it happened.')
+    messages=[{'role':'system','content':sys}]
+    for role,actor,content in rows:
+        messages.append({'role':'assistant' if role=='assistant' else 'user',
+                         'content':content if role=='assistant' else f'[Discord user {actor}]: {content}'})
+    messages.append({'role':'user','content':f'[{user_name}, user {user_id}]: {message[:3000]}'})
+    result=await ai.chat.completions.create(model=model,messages=messages,max_tokens=350,temperature=0.7)
+    answer=polish(result.choices[0].message.content or '')
+    if not answer: answer='Give me a moment, please.'
+    await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'user',message)
+    await asyncio.to_thread(save_scene,db,gid,channel_id,user_id,'assistant',answer)
+    return answer[:1900]
+
+
 
 def household_persona():
     if is_solace():
@@ -224,90 +312,78 @@ def speaker_context(user_id):
         return 'The speaker is Sly. Address him as Sly.'
     return 'The speaker is a household member or guest. Do not assume their family relationship.'
 
-async def nadia_reply(user_id, message):
+async def nadia_reply(user_id, message, channel_id=None, user_name=None):
     if not client_ai:
         return 'My conversation service is not configured yet.'
     _, _, birth_mode, _, notes = await asyncio.to_thread(setting)
-    history = await asyncio.to_thread(db, '''SELECT role,content FROM (
-        SELECT id,role,content FROM nadia_chat_history
-        WHERE guild_id=%s AND user_id=%s ORDER BY id DESC LIMIT 12
-    ) AS recent ORDER BY id ASC''', (guild_id(), user_id), True)
-    system = (household_persona() + ' ' + speaker_context(user_id) +
-              f' Current birth-story mode: {birth_mode if is_solace() else "not configured"}. Household note: {notes[:1000]}. '
-              'A fictional labor scene must not change birth mode automatically. '
-              'Household chores are started only by the task engine; never promise to start or finish chores, schedule messages, or send notifications unless the engine has confirmed a job ID. If asked to do a chore, invite the user to say Nadia plus a direct request, or use /nadia_job_start. Clinic appointments are fictional, not real examinations. You only have access to features explicitly implemented in this bot.')
-    messages = [{'role':'system','content':system}]
-    messages.extend({'role':role,'content':content} for role,content in history)
-    messages.append({'role':'user','content':message[:3000]})
-    response = await client_ai.chat.completions.create(model=CHAT_MODEL,messages=messages,max_tokens=450)
-    answer = (response.choices[0].message.content or 'I’m here.').strip()
-    await asyncio.to_thread(db, '''INSERT INTO nadia_chat_history(guild_id,user_id,role,content)
-        VALUES (%s,%s,%s,%s),(%s,%s,%s,%s)''',
-        (guild_id(),user_id,'user',message[:3000],guild_id(),user_id,'assistant',answer[:3500]))
-    return answer
+    if channel_id is None:
+        channel_id = 0
+    return await generate_reply(client_ai, CHAT_MODEL, db, guild_id(), channel_id,
+        user_id, user_name or ('Nia' if user_id == MOMMY_ID else 'Sly' if is_solace() and user_id == DADDY_ID else 'Guest'),
+        message, household_persona() + ' ' + speaker_context(user_id), birth_mode, notes)
 
 @bot.tree.command(name='nadia_talk', description='Talk with Nadia in character')
 async def talk(interaction: discord.Interaction, message: str):
     if await reject(interaction): return
     await interaction.response.defer()
     try:
-        answer = await nadia_reply(interaction.user.id,message)
+        answer = await nadia_reply(interaction.user.id,message,interaction.channel_id,interaction.user.display_name)
         await interaction.followup.send(answer[:1900])
     except Exception:
         log.exception('AI chat failed')
         await interaction.followup.send('My conversation service is temporarily unavailable. Please try again.',ephemeral=True)
 
-# Wake on the name Nadia (case-insensitive) or a direct Discord mention in ANY Solace text channel.
-_last_conversation = {}
-NADIA_WAKE = re.compile(r'(?<![\w])nadia(?:[’\']s)?(?![\w])',re.IGNORECASE)
+# Explicit summons and reply-to-bot only. Privacy is persisted per household/channel.
 @bot.event
 async def on_message(message: discord.Message):
     if message.guild is None or message.guild.id not in HOUSEHOLDS or message.author.bot:
         return
-    token=_guild_context.set(message.guild.id)
+    token = _guild_context.set(message.guild.id)
     try:
         await handle_household_message(message)
     finally:
         _guild_context.reset(token)
 
 async def handle_household_message(message: discord.Message):
-    if message.author.bot or message.guild is None or message.guild.id not in HOUSEHOLDS:
-        return
-    now=datetime.now(timezone.utc)
-    conversation_key=(message.guild.id,message.channel.id,message.author.id)
-    recent=_last_conversation.get(conversation_key)
-    replying_to_nadia=False
-    if message.reference and message.reference.resolved and isinstance(message.reference.resolved,discord.Message):
-        replying_to_nadia=message.reference.resolved.author.id == bot.user.id
-    named=bool(NADIA_WAKE.search(message.content) or (bot.user and bot.user.mentioned_in(message)))
-    followup=bool(recent and (now-recent).total_seconds()<180 and
-                  not message.mentions and not re.search(r'\b(?:hey|hi|hello)\s+@',message.content,re.I))
-    if not (named or replying_to_nadia or followup):
+    if message.content.startswith('!'):
         await bot.process_commands(message)
         return
     if not message.content.strip():
         return
-    try:
-        if await ops_request(message,message.content):
-            _last_conversation[conversation_key]=now
+    gid, cid = message.guild.id, message.channel.id
+    addressed = addressed_to_nadia(message, bot.user)
+    quiet = await asyncio.to_thread(privacy_enabled, db, gid, cid)
+    if quiet:
+        if not should_reply(message, bot.user, True):
             return
-        target=photo_request_target(message.content)
+        if message.author.id not in (MOMMY_ID, DADDY_ID) and not message.author.guild_permissions.manage_guild:
+            return
+        await asyncio.to_thread(set_privacy, db, gid, cid, message.author.id, False)
+        quiet = False
+    if not should_reply(message, bot.user, quiet):
+        return
+    if PRIVACY.search(message.content):
+        if message.author.id in (MOMMY_ID, DADDY_ID) or message.author.guild_permissions.manage_guild:
+            await asyncio.to_thread(set_privacy, db, gid, cid, message.author.id, True)
+            await message.reply('Of course. I’ll give you some space.', mention_author=False)
+        return
+    try:
+        if await ops_request(message, message.content):
+            return
+        target = photo_request_target(message.content)
         if target and (message.author.id == MOMMY_ID or (is_solace() and message.author.id == DADDY_ID)):
-            row=await asyncio.to_thread(find_named_photo,target)
+            row = await asyncio.to_thread(find_named_photo, target)
             if row:
-                pid,raw,mime,name=row
-                await message.reply(f'Here is the saved picture of **{name}**, Nia.' if message.author.id==MOMMY_ID else
-                    f'Here is the saved picture of **{name}**, Sly.',
+                pid, raw, mime, name = row
+                await message.reply(f'Here is the saved picture of **{name}**.',
                     file=image_file(raw,mime,f'nadia_reference_{pid}'),mention_author=False)
                 return
         async with message.channel.typing():
-            answer = await nadia_reply(message.author.id, message.content)
+            answer = await nadia_reply(message.author.id, message.content, cid, message.author.display_name)
         await message.reply(answer[:1900], mention_author=False)
-        _last_conversation[conversation_key]=now
     except Exception:
-        log.exception('Nadia name-triggered chat failed')
-        await message.reply('I’m having trouble answering just now. Try again in a moment.',mention_author=False)
-    await bot.process_commands(message)
+        log.exception('Nadia conversation failed')
+        await message.reply('One moment. I’m having trouble with that request.', mention_author=False)
 
 
 # ---------- Solace household operations ----------
@@ -462,6 +538,12 @@ def identify_room(text,kind):
     return DEFAULT_ROOM[kind]
 
 
+def cancel_job_by_id(job_id):
+    with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE nadia_jobs SET status='cancelled',finished_at=NOW() WHERE guild_id=%s AND id=%s AND status='running' RETURNING id", (guild_id(),job_id))
+            return cur.fetchone() is not None
+
 async def ops_request(message,body):
     if not (message.author.id in (MOMMY_ID,DADDY_ID) if is_solace() else True):return False
     low=body.lower()
@@ -469,12 +551,12 @@ async def ops_request(message,body):
         match=re.search(r'#?(\d+)\b',low)
         if match:
             jid=int(match.group(1))
-            changed=await asyncio.to_thread(db,"UPDATE nadia_jobs SET status='cancelled',finished_at=NOW() WHERE guild_id=%s AND id=%s AND status='running'",(guild_id(),jid))
-            await message.reply(f'I’ve requested cancellation of household task #{jid}. Check `/nadia_jobs` for its status.',mention_author=False)
+            changed=await asyncio.to_thread(cancel_job_by_id, jid)
+            await message.reply(f'Cancelled task #{jid}.' if changed else f'I couldn’t find a running task #{jid}.',mention_author=False)
         else:
             await message.reply('Tell me the job number to cancel. You can find it with `/nadia_jobs`.',mention_author=False)
         return True
-    if re.search(r'\b(how long|progress|status|is .*ready|what.*(doing|working on)|finished yet)\b',low):
+    if re.search(r'\b(how long|progress|status|is .*ready|what.*(doing|working on)|finished yet)\b',low) and re.search(r'\b(job|task|laundry|dishes|dishwasher|cleaning|cooking|vacuum|mopping|dusting)\b',low):
         jobs=await asyncio.to_thread(job_report,None,6,True)
         if not jobs:
             await message.reply('No household jobs are running right now.',mention_author=False)
@@ -811,7 +893,7 @@ NYLA_DATABASE_URL = os.getenv('NYLA_DATABASE_URL', '')
 NYLA_GUILD_ID = int(os.getenv('NYLA_GUILD_ID', str(SOLACE_GUILD_ID)))
 
 def nyla_care_once():
-    if not NYLA_DATABASE_URL:
+    if not NYLA_DATABASE_URL or os.getenv('NADIA_ENABLE_NYLA_CARE', 'false').lower() != 'true':
         return None
     with psycopg.connect(NYLA_DATABASE_URL,connect_timeout=10) as conn:
         with conn.cursor() as cur:
@@ -881,6 +963,7 @@ async def before_housekeeping():
 async def setup_hook():
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(ops_init)
+    await asyncio.to_thread(install_schema, db)
     for gid in HOUSEHOLDS:
         target=discord.Object(id=gid)
         bot.tree.copy_global_to(guild=target)
