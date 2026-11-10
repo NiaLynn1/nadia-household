@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import threading
+import urllib.request
+import urllib.error
 import contextvars
 from datetime import datetime, timedelta, timezone
 
@@ -27,13 +29,15 @@ TOKEN = os.environ['DISCORD_TOKEN']
 SOLACE_GUILD_ID = int(os.environ['SOLACE_GUILD_ID'])
 MAISON_GUILD_ID = int(os.environ.get('MAISON_ELISE_GUILD_ID', '1567054443390828594'))
 HOUSEHOLDS = (SOLACE_GUILD_ID, MAISON_GUILD_ID)
+TEST_NURSERY_GUILD_ID = int(os.getenv("NYLA_STAGING_GUILD_ID", "0"))
+CHAT_GUILDS = HOUSEHOLDS + ((TEST_NURSERY_GUILD_ID,) if TEST_NURSERY_GUILD_ID else ())
 _guild_context = contextvars.ContextVar('nadia_guild', default=SOLACE_GUILD_ID)
 def guild_id():
     return _guild_context.get()
 def is_solace():
     return guild_id() == SOLACE_GUILD_ID
 def house_name():
-    return 'Solace' if is_solace() else 'Maison Élise'
+    return 'Solace' if is_solace() else ('Testing Nursery' if guild_id() == TEST_NURSERY_GUILD_ID else 'Maison Élise')
 
 MOMMY_ID = int(os.environ['MOMMY_ID'])
 DADDY_ID = int(os.environ['DADDY_ID'])
@@ -48,7 +52,7 @@ app = Flask(__name__)
 @app.get('/')
 @app.get('/health')
 def health():
-    return {'service': 'nadia-households', 'status': 'online', 'nyla_integration': 'configured' if os.getenv('NYLA_DATABASE_URL') else 'not_connected'}
+    return {'service': 'nadia-households', 'status': 'online', 'nyla_integration': 'staging_bridge_configurable'}
 
 def db(sql, params=(), fetch=False):
     with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
@@ -257,7 +261,7 @@ async def on_ready():
         daily_housekeeping.start()
     if not nadia_job_clock.is_running():
         nadia_job_clock.start()
-    if NYLA_DATABASE_URL and os.getenv('NADIA_ENABLE_NYLA_CARE', 'false').lower() == 'true' and not nadia_nyla_watch.is_running():
+    if NYLA_CARE_API_URL and NYLA_CARE_API_KEY and not nadia_nyla_watch.is_running():
         nadia_nyla_watch.start()
     for gid in HOUSEHOLDS:
         guild=bot.get_guild(gid)
@@ -323,7 +327,7 @@ async def nanny(interaction: discord.Interaction, threshold: app_commands.Range[
     if await reject(interaction, True): return
     if not is_solace(): return await interaction.response.send_message('Nyla care monitoring is available in Solace.',ephemeral=True)
     await asyncio.to_thread(db,'UPDATE nadia_settings SET nanny_threshold=%s WHERE guild_id=%s',(threshold,guild_id()))
-    await interaction.response.send_message(f'Backup-care alert threshold: **{threshold}%**. Automatic monitoring is **not active** until Nyla’s approved care API is connected.')
+    await interaction.response.send_message(f'Backup-care alert threshold: **{threshold}%**. Staging bridge uses Nyla safety thresholds when configured.')
 
 @bot.tree.command(name='nadia_note', description='Save a household continuity note')
 async def note(interaction: discord.Interaction, detail: str):
@@ -546,7 +550,7 @@ async def talk(interaction: discord.Interaction, message: str):
 # Explicit summons and reply-to-bot only. Privacy is persisted per household/channel.
 @bot.event
 async def on_message(message: discord.Message):
-    if message.guild is None or message.guild.id not in HOUSEHOLDS or message.author.bot:
+    if message.guild is None or message.guild.id not in CHAT_GUILDS or message.author.bot:
         return
     token = _guild_context.set(message.guild.id)
     try:
@@ -1219,64 +1223,34 @@ async def wellness(interaction: discord.Interaction, concern: str):
         await interaction.followup.send('The wellness service is temporarily unavailable.',ephemeral=True)
 
 
-# Optional Nyla care integration: configure NYLA_DATABASE_URL and NYLA_GUILD_ID.
-# The integration is Solace-only. Never query Nyla's father-identifying records.
-NYLA_DATABASE_URL = os.getenv('NYLA_DATABASE_URL', '')
-NYLA_GUILD_ID = int(os.getenv('NYLA_GUILD_ID', str(SOLACE_GUILD_ID)))
+# Private staging bridge. No Nyla DB credentials are used by Nadia.
+# Point only to the staging Nyla service; never to the live family bot.
+NYLA_CARE_API_URL=os.getenv('NYLA_CARE_API_URL','').rstrip('/')
+NYLA_CARE_API_KEY=os.getenv('NYLA_CARE_API_KEY','')
+NYLA_STAGING_GUILD_ID=int(os.getenv('NYLA_STAGING_GUILD_ID','0'))
 
 def nyla_care_once():
-    if not NYLA_DATABASE_URL or os.getenv('NADIA_ENABLE_NYLA_CARE', 'false').lower() != 'true':
+    if not NYLA_CARE_API_URL or len(NYLA_CARE_API_KEY)<32 or not NYLA_STAGING_GUILD_ID:
         return None
-    with psycopg.connect(NYLA_DATABASE_URL,connect_timeout=10) as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT test_mode,dormant FROM nyla_mode WHERE guild_id=%s FOR UPDATE',(NYLA_GUILD_ID,))
-            mode_row=cur.fetchone()
-            if not mode_row or mode_row[1]: return None
-            test=mode_row[0]
-            table='nyla_test_state' if test else 'baby_state'
-            cur.execute(f'''SELECT location_id,fullness,diaper_freshness,comfort,energy,sleeping
-                FROM {table} WHERE guild_id=%s FOR UPDATE''',(NYLA_GUILD_ID,))
-            row=cur.fetchone()
-            if not row or not row[0]: return None
-            channel_id,fullness,diaper,comfort,energy,sleeping=row
-            # Act early enough to help, and do not force sleep while a child is sleeping.
-            threshold_rows=db('SELECT nanny_threshold FROM nadia_settings WHERE guild_id=%s',(SOLACE_GUILD_ID,),True)
-            threshold=max(5,threshold_rows[0][0] if threshold_rows else 25)
-            if fullness<=threshold:
-                cur.execute(f'''UPDATE {table} SET fullness=100,last_feed=NOW(),
-                    diaper_freshness=GREATEST(0,diaper_freshness-6),
-                    comfort=LEAST(100,comfort+12),last_alert=NULL,last_alert_level=0
-                    WHERE guild_id=%s''',(NYLA_GUILD_ID,))
-                action='feeding'; line='🍼 *Nadia gently feeds Nyla, pauses for burping, and settles her comfortably.*'
-            elif diaper<=threshold:
-                cur.execute(f'''UPDATE {table} SET diaper_freshness=100,comfort=LEAST(100,comfort+10),
-                    last_alert=NULL,last_alert_level=0 WHERE guild_id=%s''',(NYLA_GUILD_ID,))
-                action='diaper change';line='🧷 *Nadia changes Nyla into a fresh diaper and gets her comfortable again.*'
-            elif comfort<=threshold:
-                cur.execute(f'''UPDATE {table} SET comfort=LEAST(100,comfort+35),
-                    last_alert=NULL,last_alert_level=0 WHERE guild_id=%s''',(NYLA_GUILD_ID,))
-                action='comfort';line='💗 *Nadia picks Nyla up gently and soothes her until she settles.*'
-            elif energy<=threshold and not sleeping:
-                # Do not invent a completed sleep; Nyla's sleep clock owns energy recovery.
-                return None
-            else:return None
-            events='nyla_test_events' if test else 'family_events'
-            cur.execute(f'''INSERT INTO {events}(guild_id,channel_id,author_id,kind,content)
-                VALUES (%s,%s,NULL,'nadia_care',%s)''',(NYLA_GUILD_ID,channel_id,action))
-            return channel_id,line
+    if not NYLA_CARE_API_URL.startswith('https://'):
+        raise RuntimeError('Nyla staging care bridge requires HTTPS')
+    payload=json.dumps({'staging_guild_id':NYLA_STAGING_GUILD_ID}).encode()
+    req=urllib.request.Request(NYLA_CARE_API_URL+'/internal/nadia/check',data=payload,
+        headers={'Content-Type':'application/json','X-Nyla-Care-Key':NYLA_CARE_API_KEY},method='POST')
+    with urllib.request.urlopen(req,timeout=15) as resp:
+        result=json.load(resp)
+    if result.get('status')=='completed':
+        log.info('Nyla confirmed Nadia completed %s',result.get('action'))
+    return result
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=1)
 async def nadia_nyla_watch():
-    if not NYLA_DATABASE_URL: return
     try:
-        result=await asyncio.to_thread(nyla_care_once)
-        if result:
-            channel_id,line=result
-            channel=bot.get_channel(channel_id)
-            if channel:
-                await channel.send(line)
+        await asyncio.to_thread(nyla_care_once)
+        # Deliberately silent in Discord: parents see Nyla's natural cues,
+        # and Nadia can describe completed care if asked later.
     except Exception:
-        log.exception('Nyla care integration failed; no care confirmation was posted')
+        log.exception('Nyla staging nanny bridge unavailable; no care was claimed')
 
 @nadia_nyla_watch.before_loop
 async def before_nyla_watch():
