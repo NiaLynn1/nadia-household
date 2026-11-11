@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import threading
+import urllib.request
+import urllib.error
 import contextvars
 from datetime import datetime, timedelta, timezone
 
@@ -27,13 +29,13 @@ TOKEN = os.environ['DISCORD_TOKEN']
 SOLACE_GUILD_ID = int(os.environ['SOLACE_GUILD_ID'])
 MAISON_GUILD_ID = int(os.environ.get('MAISON_ELISE_GUILD_ID', '1567054443390828594'))
 HOUSEHOLDS = (SOLACE_GUILD_ID, MAISON_GUILD_ID)
-_guild_context = contextvars.ContextVar('nadia_guild', default=SOLACE_GUILD_ID)
+_guild_context = contextvars.ContextVar('nadia_guild', default=None)
 def guild_id():
     return _guild_context.get()
 def is_solace():
     return guild_id() == SOLACE_GUILD_ID
 def house_name():
-    return 'Solace' if is_solace() else 'Maison Élise'
+    return 'Solace' if is_solace() else 'Maison Élise' if guild_id() == MAISON_GUILD_ID else 'Unknown household'
 
 MOMMY_ID = int(os.environ['MOMMY_ID'])
 DADDY_ID = int(os.environ['DADDY_ID'])
@@ -48,7 +50,7 @@ app = Flask(__name__)
 @app.get('/')
 @app.get('/health')
 def health():
-    return {'service': 'nadia-households', 'status': 'online', 'nyla_integration': 'pending_authenticated_api'}
+    return {'service': 'nadia-households', 'status': 'online', 'nyla_integration': 'staging_bridge_configurable'}
 
 def db(sql, params=(), fetch=False):
     with psycopg.connect(DATABASE_URL, connect_timeout=10) as conn:
@@ -257,7 +259,7 @@ async def on_ready():
         daily_housekeeping.start()
     if not nadia_job_clock.is_running():
         nadia_job_clock.start()
-    if False and not nadia_nyla_watch.is_running():
+    if (NYLA_CARE_API_URL and len(NYLA_CARE_API_KEY)>=32 and NYLA_STAGING_GUILD_ID==1567342896842018946 and not nadia_nyla_watch.is_running()):
         nadia_nyla_watch.start()
     for gid in HOUSEHOLDS:
         guild=bot.get_guild(gid)
@@ -323,7 +325,7 @@ async def nanny(interaction: discord.Interaction, threshold: app_commands.Range[
     if await reject(interaction, True): return
     if not is_solace(): return await interaction.response.send_message('Nyla care monitoring is available in Solace.',ephemeral=True)
     await asyncio.to_thread(db,'UPDATE nadia_settings SET nanny_threshold=%s WHERE guild_id=%s',(threshold,guild_id()))
-    await interaction.response.send_message(f'Backup-care alert threshold: **{threshold}%**. Automatic monitoring is **not active** until Nyla’s approved care API is connected.')
+    await interaction.response.send_message(f'Backup-care alert threshold: **{threshold}%**. Staging bridge uses Nyla safety thresholds when configured.')
 
 @bot.tree.command(name='nadia_note', description='Save a household continuity note')
 async def note(interaction: discord.Interaction, detail: str):
@@ -483,7 +485,8 @@ async def generate_reply(ai, model, db, gid, channel_id, user_id, user_name, mes
          '\nHousehold note: '+str(notes or '')[:1000]+
          ('\nCANONICAL POSTPARTUM FACT: Nyla has ALREADY BEEN BORN. She is outside Nia’s body. No labor, dilation, fetal exams, or birth-pending language. Treat this as settled scene history. Do not ask for another exam unless Nia specifically requests it. Never invent where Nyla is; ask the family if her location has not been established. ' if gid==SOLACE_GUILD_ID and birth_mode=='postpartum' else '')+
          '\nRecent dialogue includes different speakers. Respond to the CURRENT speaker, not everyone in the scene. '+
-         'In Solace, both Nia and Sly have approved Nyla going live in the story; this does not verify activation of the separate Nyla bot. Do not request their story approval again. '+
+         ('In Solace, both Nia and Sly have approved Nyla going live in the story; this does not verify activation of the separate Nyla bot. Do not request their story approval again. ' if gid == SOLACE_GUILD_ID else '')+
+
          'Never leak information across households. In Solace labor scenes, Nadia is the established qualified midwife, not a bystander. The persistent birth mode is authoritative: postpartum means Nyla is already born; waiting/labor do not establish birth. Preserve continuity across the entire scene and never contradict a previously established exam. Ask consent before examinations. Do not assert exact dilation before the fictional exam. '+
          'Only the existing task engine can start chores. Household commitments can be scheduled for fictional completion. Do not claim a real-world action happened. '+
          'In fictional medical scenes, once Nia herself consents to an examination, narrate the assessment and give a clear specific fictional finding rather than vague reassurance. Keep the finding consistent with earlier scene results. When asked for results of a completed exam, answer immediately with the actual fictional finding and next step. If a completed exam has no numerical finding yet, establish a plausible fictional finding explicitly during the consented narrated exam and give its measurement in cm. Once recorded, reuse the recorded value until another consented exam changes it. Do not pretend a new examination occurred just because someone asks how dilated Nia is. Never turn vague reassurance into a medical measurement. Avoid telling Nia to wait for the urge to push before using the birthing pool; water immersion for comfort can be discussed earlier in labor if appropriate to the scene. Do not repeatedly request consent or evade the question. Do not treat Sly consenting as Nia consenting. Clinical results are fictional story details, not real diagnostic measurements.')
@@ -1219,31 +1222,36 @@ async def wellness(interaction: discord.Interaction, concern: str):
         await interaction.followup.send('The wellness service is temporarily unavailable.',ephemeral=True)
 
 
-# Optional Nyla care integration: configure NYLA_DATABASE_URL and NYLA_GUILD_ID.
-# The integration is Solace-only. Never query Nyla's father-identifying records.
-NYLA_DATABASE_URL = os.getenv('NYLA_DATABASE_URL', '')
-NYLA_GUILD_ID = int(os.getenv('NYLA_GUILD_ID', str(SOLACE_GUILD_ID)))
+# Private staging bridge. No Nyla DB credentials are used by Nadia.
+# Point only to the staging Nyla service; never to the live family bot.
+NYLA_CARE_API_URL=os.getenv('NYLA_CARE_API_URL','').rstrip('/')
+NYLA_CARE_API_KEY=os.getenv('NYLA_CARE_API_KEY','')
+NYLA_STAGING_GUILD_ID=int(os.getenv('NYLA_STAGING_GUILD_ID','0'))
 
 def nyla_care_once():
-    """Fail closed: direct cross-database writes are retired.
+    if not NYLA_CARE_API_URL or len(NYLA_CARE_API_KEY)<32:
+        return None
+    if NYLA_STAGING_GUILD_ID != 1567342896842018946:
+        raise RuntimeError('Refusing to connect to an unapproved Nyla staging guild')
+    if not NYLA_CARE_API_URL.startswith('https://'):
+        raise RuntimeError('Nyla staging care bridge requires HTTPS')
+    payload=json.dumps({'staging_guild_id':NYLA_STAGING_GUILD_ID}).encode()
+    req=urllib.request.Request(NYLA_CARE_API_URL+'/internal/nadia/check',data=payload,
+        headers={'Content-Type':'application/json','X-Nyla-Care-Key':NYLA_CARE_API_KEY},method='POST')
+    with urllib.request.urlopen(req,timeout=15) as resp:
+        result=json.load(resp)
+    if result.get('status')=='completed':
+        log.info('Nyla confirmed Nadia completed %s',result.get('action'))
+    return result
 
-    Nadia must use a future authenticated Nyla-owned care API. Never infer
-    successful care or announce it based on Nadia's own narration.
-    """
-    return None
-
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=1)
 async def nadia_nyla_watch():
-    if True: return  # Awaiting authenticated, Nyla-owned care API
     try:
-        result=await asyncio.to_thread(nyla_care_once)
-        if result:
-            channel_id,line=result
-            channel=bot.get_channel(channel_id)
-            if channel:
-                await channel.send(line)
+        await asyncio.to_thread(nyla_care_once)
+        # Deliberately silent in Discord: parents see Nyla's natural cues,
+        # and Nadia can describe completed care if asked later.
     except Exception:
-        log.exception('Nyla care integration failed; no care confirmation was posted')
+        log.exception('Nyla staging nanny bridge unavailable; no care was claimed')
 
 @nadia_nyla_watch.before_loop
 async def before_nyla_watch():
