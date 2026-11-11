@@ -1286,9 +1286,26 @@ def nyla_care_once():
 @tasks.loop(minutes=1)
 async def nadia_nyla_watch():
     try:
-        await asyncio.to_thread(nyla_care_once)
-        # Deliberately silent in Discord: parents see Nyla's natural cues,
-        # and Nadia can describe completed care if asked later.
+        result=await asyncio.to_thread(nyla_care_once)
+        if result and result.get('status')=='completed':
+            channel_id=int(result.get('channel_id') or 0)
+            event_id=result.get('event_id')
+            if channel_id and event_id is not None:
+                channel=bot.get_channel(channel_id)
+                if channel and getattr(channel.guild,'id',None)==NYLA_STAGING_GUILD_ID:
+                    kind=result.get('action')
+                    lines={
+                        'feed':['*Nadia cradles Nyla and offers her a bottle, pausing to burp her before settling her comfortably.* "There we are, sweetheart."',
+                                '*Nadia feeds Nyla at an unhurried pace, then gently burps her.* "All fed, little love."'],
+                        'change':['*Nadia changes Nyla into a clean diaper and straightens her onesie.* "Much better, darling."',
+                                  '*Nadia finishes Nyla’s diaper change, making sure she is dry and comfortable.* "There you go, little one."'],
+                        'comfort':['*Nadia gathers Nyla into her arms, supporting her head as she rocks her gently.* "I’ve got you, sweetheart."',
+                                   '*Nadia holds Nyla close and soothes her with a quiet voice.* "You’re all right, little love."'],
+                        'sleep':['*Nadia gently rocks a restless Nyla until she settles, then places her on her back in her bassinet.* "Sleep well, darling."']}
+                    import random
+                    await channel.send(random.choice(lines.get(kind,[result.get('description','Nadia completed care.')]))[:1800])
+                else:
+                    log.warning('Nyla care completed but staging channel %s unavailable; event %s remains recorded',channel_id,event_id)
     except Exception:
         log.exception('Nyla staging nanny bridge unavailable; no care was claimed')
 
