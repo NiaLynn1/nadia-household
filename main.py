@@ -29,6 +29,10 @@ TOKEN = os.environ['DISCORD_TOKEN']
 SOLACE_GUILD_ID = int(os.environ['SOLACE_GUILD_ID'])
 MAISON_GUILD_ID = int(os.environ.get('MAISON_ELISE_GUILD_ID', '1567054443390828594'))
 HOUSEHOLDS = (SOLACE_GUILD_ID, MAISON_GUILD_ID)
+TEST_NURSERY_GUILD_ID = int(os.getenv('NYLA_STAGING_GUILD_ID', '0'))
+APPROVED_TEST_NURSERY_ID = 1567342896842018946
+if TEST_NURSERY_GUILD_ID and TEST_NURSERY_GUILD_ID != APPROVED_TEST_NURSERY_ID:
+    raise RuntimeError('Unapproved Testing Nursery guild ID')
 _guild_context = contextvars.ContextVar('nadia_guild', default=None)
 def guild_id():
     return _guild_context.get()
@@ -246,7 +250,7 @@ async def reject(interaction, parents=False):
 
 @bot.tree.interaction_check
 async def set_interaction_household(interaction: discord.Interaction):
-    if interaction.guild_id not in HOUSEHOLDS:
+    if interaction.guild_id not in HOUSEHOLDS and interaction.guild_id != TEST_NURSERY_GUILD_ID:
         return False
     _guild_context.set(interaction.guild_id)
     return True
@@ -549,13 +553,48 @@ async def talk(interaction: discord.Interaction, message: str):
 # Explicit summons and reply-to-bot only. Privacy is persisted per household/channel.
 @bot.event
 async def on_message(message: discord.Message):
-    if message.guild is None or message.guild.id not in HOUSEHOLDS or message.author.bot:
+    if message.guild is None or message.author.bot:
+        return
+    if TEST_NURSERY_GUILD_ID and message.guild.id == TEST_NURSERY_GUILD_ID:
+        await handle_testing_nursery_message(message)
+        return
+    if message.guild.id not in HOUSEHOLDS:
         return
     token = _guild_context.set(message.guild.id)
     try:
         await handle_household_message(message)
     finally:
         _guild_context.reset(token)
+
+async def handle_testing_nursery_message(message: discord.Message):
+    """Separate staging conversation: never load household persona, memories or data."""
+    if not message.content.strip() or not addressed_to_nadia(message, bot.user):
+        return
+    if not client_ai:
+        await message.reply('I am here in the Testing Nursery. My chat service is not configured, but my care bridge runs separately.', mention_author=False)
+        return
+    try:
+        async with message.channel.typing():
+            result = await client_ai.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=[
+                    {'role':'system','content':(
+                        'You are Nadia St. Clair in the isolated Nyla Staging Testing Nursery. '
+                        'This is a simulated newborn care testing environment, not a household. '
+                        'You may help discuss staging care tests, the 40/100 cue, 10-minute parent grace period, '
+                        '20/100 critical threshold, and dormant mode. '
+                        'Do not claim to have performed any care or checked live baby state; '
+                        'only the private staging API can confirm care. '
+                        'Do not mention or infer any information from other Discord servers, families, '
+                        'households, private memories, photos, or prior conversations. '
+                        'Keep replies warm, concise, and factual.')},
+                    {'role':'user','content':message.content[:2000]}
+                ], max_tokens=250, temperature=0.5)
+        answer=(result.choices[0].message.content or '').strip()
+        await message.reply(answer[:1900] or 'I am here, and the staging connection is separate from chat.', mention_author=False)
+    except Exception:
+        log.exception('Testing Nursery conversation failed')
+        await message.reply('I am here, but my staging conversation service is temporarily unavailable.', mention_author=False)
 
 async def handle_household_message(message: discord.Message):
     if message.content.startswith('!'):
@@ -1266,6 +1305,30 @@ async def daily_housekeeping():
 async def before_housekeeping():
     await bot.wait_until_ready()
 
+# Staging-only slash commands. Do not copy household commands into the nursery.
+if TEST_NURSERY_GUILD_ID:
+    _test_guild = discord.Object(id=TEST_NURSERY_GUILD_ID)
+
+    @bot.tree.command(name='nadia_test_status', description='Check Nadia staging connection configuration', guild=_test_guild)
+    async def nadia_test_status(interaction: discord.Interaction):
+        if interaction.guild_id != TEST_NURSERY_GUILD_ID:
+            return await interaction.response.send_message('Testing Nursery only.', ephemeral=True)
+        bridge_ready = bool(NYLA_CARE_API_URL.startswith('https://') and len(NYLA_CARE_API_KEY)>=32 and NYLA_STAGING_GUILD_ID==TEST_NURSERY_GUILD_ID)
+        await interaction.response.send_message(
+            '🍼 **Nadia | Testing Nursery**\n'
+            f'Staging bridge configured: **{"Yes" if bridge_ready else "No"}**\n'
+            'This checks configuration only, not whether a care action succeeded.\n'
+            'Household memories and commands: **isolated**', ephemeral=True)
+
+    @bot.tree.command(name='nadia_test_help', description='Explain Nadia backup-caregiver staging rules', guild=_test_guild)
+    async def nadia_test_help(interaction: discord.Interaction):
+        await interaction.response.send_message(
+            '🍼 **Backup caregiver test**\n'
+            'At 40/100 or below, Nyla staging begins a parental grace period of up to 10 minutes. '
+            'At 20/100 or below, care may happen sooner. '
+            'Dormant mode blocks automatic care. '
+            'Nadia checks silently through the staging API; this command does not change needs.', ephemeral=True)
+
 @bot.event
 async def setup_hook():
     await asyncio.to_thread(init_db)
@@ -1276,6 +1339,9 @@ async def setup_hook():
         bot.tree.copy_global_to(guild=target)
         synced=await bot.tree.sync(guild=target)
         log.info('Synced %s commands for guild %s',len(synced),gid)
+    if TEST_NURSERY_GUILD_ID:
+        synced=await bot.tree.sync(guild=discord.Object(id=TEST_NURSERY_GUILD_ID))
+        log.info('Synced %s staging-only commands for Testing Nursery %s',len(synced),TEST_NURSERY_GUILD_ID)
 
 def serve():
     app.run(host='0.0.0.0',port=PORT,use_reloader=False)
